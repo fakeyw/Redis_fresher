@@ -224,11 +224,125 @@ root       2151  0.0  0.1  14224  1020 pts/1    S+   04:16   0:00 grep --color=a
 
 现在已经成功开启足够的实验结点，可以开始构建集群。
 
+另，关闭结点的命令常用：
+
+>redis-cli -h [ip] -p [port] -a [passwd] shutdown
+
 ###### 构建集群
 
 ---
 
 在redis主目录 /src下有自带的 redis-trib.rb 是ruby语言的集群构建脚本，需要安装Ruby环境。
 
-[ruby官网安装文档](www.ruby-lang.org/en/documentation/installation)
+详见：[ruby官网安装文档](www.ruby-lang.org/en/documentation/installation)
+
+Ruby环境安装好之后
+
+执行
+
+>ruby redis-trib.rb create --replicas 1 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005
+
+来构建由五个结点构成的集群，
+其中 `replicas` 参数为每个主结点的从结点数量。
+
+但在纯净的系统中很可能出现如下报错：
+
+```
+/usr/lib/ruby/2.3.0/rubygems/core_ext/kernel_require.rb:55:in `require': cannot load such file -- redis (LoadError)
+```
+
+意思是无法加载redis，查了一下是指ruby的redis依赖模块。
+
+执行
+
+>gem install redis
+
+如果长时间没有反应，说明网络有问题，大家都懂的
+
+那么直接去官方渠道下载 [Redis](https://rubygems.org/gems/redis/)
+
+以下为4.0.1版本正常操作与反馈：
+
+```
+root@ubuntu:/home/fakeyw/redis-4.0.8# wget https://rubygems.org/downloads/redis-4.0.1.gem
+--2018-03-09 07:44:05--  https://rubygems.org/downloads/redis-4.0.1.gem
+Resolving rubygems.org (rubygems.org)... 151.101.194.2, 151.101.2.2, 151.101.66.2, ...
+Connecting to rubygems.org (rubygems.org)|151.101.194.2|:443... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 91648 (90K) [application/octet-stream]
+Saving to: ‘redis-4.0.1.gem’
+
+redis-4.0.1.gem     100%[===================>]  89.50K  71.5KB/s    in 1.3s
+
+2018-03-09 07:44:07 (71.5 KB/s) - ‘redis-4.0.1.gem’ saved [91648/91648]
+
+root@ubuntu:/home/fakeyw/redis-4.0.8# gem install redis-4.0.1.gem
+Successfully installed redis-4.0.1
+Parsing documentation for redis-4.0.1
+Installing ri documentation for redis-4.0.1
+Done installing documentation for redis after 1 seconds
+1 gem installed
+```
+
+再次运行构建命令
+
+然而报错
+
+>[ERR] Sorry, can't connect to node 127.0.0.1:7000
+
+一般来说有两种情况：
+
+1. 未开放ip或端口。因为是本地连接，所以排除
+2. 配置中的bind不对。ps查看时为 ‘ * ’，即所有ip，排除
+
+查看了配置文件，最后发现是认证的问题，因为之前在配置中设置了密码。
+
+而ruby集群构建脚本是不能带密码连接的，需要在集群构成后进行设置。
+
+而且对集群设置密码时，requirepass与masterauth都要设置，否则在主从切换时会遇到授权问题。且每个结点要求一致，否则Redirected会失败。（re和ma两个密码是否需要一致有待求证）
+
+取消密码，再次运行脚本，完成集群构建
+
+```bash
+127.0.0.1:7000> cluster info
+cluster_state:ok
+cluster_slots_assigned:16384
+cluster_slots_ok:16384
+cluster_slots_pfail:0
+cluster_slots_fail:0
+cluster_known_nodes:6
+cluster_size:3
+cluster_current_epoch:6
+cluster_my_epoch:1
+cluster_stats_messages_ping_sent:248
+cluster_stats_messages_pong_sent:263
+cluster_stats_messages_sent:511
+cluster_stats_messages_ping_received:263
+cluster_stats_messages_pong_received:248
+cluster_stats_messages_received:511
+```
+
+虽然说16384个槽位都有所属，集群也正常，但其实构建过程中是有报错的
+
+>[ERR] Sorry, can't connect to node 192.168.179.128:7004
+>......
+>[ERR] Not all 16384 slots are covered by nodes.
+
+像这样显示实际ip的
+
+排查后发现只有配置为 bind 127.0.0.1 192.168.179.128 时才完全正常。
+
+显示为：
+
+```bash
+......
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+```
+
+> P.S. : 在测试时写了三个shell脚本，分别用于启动所有结点、关闭所有结点、完全初始化结点文件。不建议完全手动进行测试，效率太低。
+
+
 
