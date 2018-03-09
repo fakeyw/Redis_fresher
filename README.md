@@ -1,3 +1,5 @@
+## Redis急速入门日志
+
 ## About Redis 
 
 redis是一种存储结构类似Nosql的数据储存系统。
@@ -151,7 +153,7 @@ print(t)
 
 再次运行脚本，然后...
 
-> redis.exceptions.ResponseError: DENIED Redis is running in protected mode because protected mode is enabled, no bind address was specified, no authentication password is requested to clients. In this mode connections are only accepted from the loopback interface. If you want to connect from external computers to Redis you may adopt one of the following solutions: 1) Just disable protected mode sending the command 'CONFIG SET protected-mode no' from the loopback interface by connecting to Redis from the same host the server is running, however MAKE SURE Redis is not publicly accessible from internet if you do so. Use CONFIG REWRITE to make this change permanent. 2) Alternatively you can just disable the protected mode by editing the Redis configuration file, and setting the protected mode option to 'no', and then restarting the server. 3) If you started the server manually just for testing, restart it with the '--protected-mode no' option. 4) Setup a bind address or an authentication password. NOTE: You only need to do one of the above things in order for the server to start accepting connections from the outside.
+> redis.exceptions.ResponseError: DENIED Redis is running in protected mode because protected mode is enabled, no bind address was specified, no authentication password is requested to clients. In this mode connections are only accepted from the loopback interface. If you want to connect from external computers to Redis you may adopt one of the following solutions: **1) Just disable protected mode sending the command 'CONFIG SET protected-mode no' from the loopback interface by connecting to Redis from the same host the server is running, however MAKE SURE Redis is not publicly accessible from internet if you do so. Use CONFIG REWRITE to make this change permanent. 2) Alternatively you can just disable the protected mode by editing the Redis configuration file, and setting the protected mode option to 'no', and then restarting the server. 3) If you started the server manually just for testing, restart it with the '--protected-mode no' option. 4) Setup a bind address or an authentication password. NOTE: You only need to do one of the above things in order for the server to start accepting connections from the outside.**
 
 这么一大段文字作为警报弹出来，写得很明显，还是配置的问题。
 
@@ -177,9 +179,56 @@ True
 
 连接成功。
 
-
-
 ## Redis Sentinel&Cluster
 
+###### 开启多个结点
+
 ---
+
+redis结点的功能是由.conf配置文件来调整的
+
+可以根据多个配置文件开启多个redis服务结点
+
+而集群正式运作需要至少三个结点，为了体现redis主从结点的复制特点，在三个主结点`master`的基础上最好添加数个从结点`slaver`
+
+1.为每个结点创建一个文件夹
+
+P.S. : 对于每个结点，需要一个相对独立空间。因为每个结点的结点配置文件(与服务配置文件不同)、操作日志aof文件，在同一目录下只能存在一份。而这些文件保存在用户启动服务时，所在的当前文件夹下。
+
+2.复制一份redis主目录给出的redis.conf文件，找到如下条目修改为：
+
+> cluster-enable yes #开启集群功能
+>
+> cluster-config-file nodes.conf #这就是上面所说的 结点配置文件，为了分辨可以自行命名
+>
+> cluster-node-timeout 15000 #在确认结点是否正常工作(PING-PONG)时的的等待时间
+>
+> appendonly yes #可选，在数据库持久化的基础上保存每一条操作日志，牺牲部分性能尽量保证数据完整性
+
+3.将这份配置复制到每个结点的文件夹中，更改.conf中的port，选择结点监听的端口。
+
+4.依次cd到每个文件夹中，运行 `redis-server redis.conf` ，此时文件夹中会自动产生nodes.conf(由配置决定)，如果开启了aof持久化，还会出现appendonly.aof。
+
+5.查看后台进程（我用了六个结点）：
+
+```bash
+root@ubuntu:/home/fakeyw/redis-cls-7005# ps -aux|grep redis
+root       2108  0.1  1.0  46808 10368 ?        Ssl  04:15   0:00 redis-server *:7000 [cluster]
+root       2115  0.0  1.0  46808 10348 ?        Ssl  04:15   0:00 redis-server *:7001 [cluster]
+root       2124  0.0  1.0  46808 10392 ?        Ssl  04:16   0:00 redis-server *:7002 [cluster]
+root       2131  0.2  1.0  46808 10396 ?        Ssl  04:16   0:00 redis-server *:7003 [cluster]
+root       2139  0.3  1.0  46808 10456 ?        Ssl  04:16   0:00 redis-server *:7004 [cluster]
+root       2146  0.6  1.0  46808 10356 ?        Ssl  04:16   0:00 redis-server *:7005 [cluster]
+root       2151  0.0  0.1  14224  1020 pts/1    S+   04:16   0:00 grep --color=auto redis
+```
+
+现在已经成功开启足够的实验结点，可以开始构建集群。
+
+###### 构建集群
+
+---
+
+在redis主目录 /src下有自带的 redis-trib.rb 是ruby语言的集群构建脚本，需要安装Ruby环境。
+
+[ruby官网安装文档](www.ruby-lang.org/en/documentation/installation)
 
