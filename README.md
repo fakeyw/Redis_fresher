@@ -30,7 +30,7 @@ redis是一种存储结构类似Nosql的数据储存系统。
 ---
 一般作为服务器常用ubuntu server/centos等linux系系统
 
-在Ubuntu下，可使用如下命令安装：
+在Ubuntu下，可使用如下命令安装（不推荐使用）：
 
 ```bash
 sudo apt-get update
@@ -38,6 +38,7 @@ sudo apt-get install redis-server
 ```
 
 在redis官网上给出了通用的下载与安装命令
+
 ```bash
 $ wget http://download.redis.io/releases/redis-4.0.8.tar.gz
 $ tar xzf redis-4.0.8.tar.gz
@@ -149,7 +150,7 @@ print(t)
 
 是因为redis-server默认配置为 bind 127.0.0.1，也就是本地请求
 
-要在配置里改为 0.0.0.0 或直接注释掉，重启服务。
+要在配置里改为 对应ip 或直接注释掉，重启服务。
 
 再次运行脚本，然后...
 
@@ -222,7 +223,7 @@ root       2146  0.6  1.0  46808 10356 ?        Ssl  04:16   0:00 redis-server *
 root       2151  0.0  0.1  14224  1020 pts/1    S+   04:16   0:00 grep --color=auto redis
 ```
 
-现在已经成功开启足够的实验结点，可以开始构建集群。
+现在已经成功开启足够的实验结点，可以开始尝试构建集群。
 
 另，关闭结点的命令常用：
 
@@ -234,7 +235,7 @@ root       2151  0.0  0.1  14224  1020 pts/1    S+   04:16   0:00 grep --color=a
 
 在redis主目录 /src下有自带的 redis-trib.rb 是ruby语言的集群构建脚本，需要安装Ruby环境。
 
-详见：[ruby官网安装文档](www.ruby-lang.org/en/documentation/installation)
+详见：[ruby官方安装文档](http://www.ruby-lang.org/en/downloads/)
 
 Ruby环境安装好之后
 
@@ -247,7 +248,7 @@ Ruby环境安装好之后
 
 但在纯净的系统中很可能出现如下报错：
 
-```
+```bash
 /usr/lib/ruby/2.3.0/rubygems/core_ext/kernel_require.rb:55:in `require': cannot load such file -- redis (LoadError)
 ```
 
@@ -259,7 +260,7 @@ Ruby环境安装好之后
 
 如果长时间没有反应，说明网络有问题，大家都懂的
 
-那么直接去官方渠道下载 [Redis](https://rubygems.org/gems/redis/)
+实在没办法连接就直接去官方渠道下载 [Redis包](https://rubygems.org/gems/redis/)
 
 以下为4.0.1版本正常操作与反馈：
 
@@ -332,6 +333,8 @@ cluster_stats_messages_received:511
 
 排查后发现只有配置为 bind 127.0.0.1 192.168.179.128 时才完全正常。
 
+目前集群时规模为三个结点，三主三从的最小集群。
+
 显示为：
 
 ```bash
@@ -343,6 +346,110 @@ cluster_stats_messages_received:511
 ```
 
 > P.S. : 在测试时写了三个shell脚本，分别用于启动所有结点、关闭所有结点、完全初始化结点文件。不建议完全手动进行测试，效率太低。
+
+###### 内网分布式集群
+
+---
+
+分布式集群实际上只是将本地结点迁移到其他主机或容器中，仍然是通过更改bind ip来监听与互联。
+
+在这里以将docker容器中一对容器加入本地集群作为例子。
+
+但刚开始似乎遇到了很严重的问题，ubuntu:16.04容器中无法加载配置启动redis
+
+那么试试centos的容器
+
+> 关于Centos，安装ssh服务时要安装openssh-server与openssh-clients 而不是 openssh-client
+>
+> 另，docker centos镜像没有service命令（不影响集群构建），恢复：
+>
+> yum install initscripts 
+
+可以正常从配置启动。
+
+远程添加结点：
+
+>```
+>ruby redis-trib.rb add-node 172.17.0.3:6397 127.0.0.1:7000
+>```
+
+显示是成功的，但几秒后这个结点就从记录中消失了。。
+
+尝试添加本地结点 127.0.0.1:7006
+
+成功添加并分片（命令如下），此结点成为主节点。
+
+```bash
+root@ubuntu:/home/fakeyw/redis-cls-7006# ruby ../redis-4.0.8/src/redis-trib.rb add-node 127.0.0.1:7006 127.0.0.1:7000
+.......
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+>>> Send CLUSTER MEET to node 127.0.0.1:7006 to make it join the cluster.
+[OK] New node added correctly.
+root@ubuntu:/home/fakeyw/redis-cls-7006# ruby ../redis-4.0.8/src/redis-trib.rb reshard 127.0.0.1:7000
+......
+Moving slot 11252 from 127.0.0.1:7002 to 192.168.179.128:7006:
+Moving slot 11253 from 127.0.0.1:7002 to 192.168.179.128:7006:
+Moving slot 11254 from 127.0.0.1:7002 to 192.168.179.128:7006:
+Moving slot 11255 from 127.0.0.1:7002 to 192.168.179.128:7006:
+```
+
+说明添加结点没有问题，这时需要解决远程结点添加不成功的问题。
+
+Several hours later...
+
+在一种苛刻条件下，成功构建了包含远程结点的集群:
+
+```bash
+root@ubuntu:/home/fakeyw# ruby redis-4.0.8/src/redis-trib.rb create --replicas 1 192.168.179.128:7000 192.168.179.128:7001 192.168.179.128:7002 192.168.179.128:7003 192.168.179.128:7004 192.168.179.128:7005 192.168.179.129:7777
+>>> Creating cluster
+>>> Performing hash slots allocation on 7 nodes...
+Using 3 masters:
+192.168.179.128:7000
+192.168.179.129:7777
+192.168.179.128:7001
+......
+......
+......
+S: 7d066691090762d927cffdb065d721bc2754eb43 192.168.179.128:7003
+   slots: (0 slots) slave
+   replicates a1cf5bff7895650d67d7bf09ed05dbf2947d34a0
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+```
+
+当前条件为：每个节点的配置 bind 不能为127.0.0.1而是内网ip（如果需要映射到公网，之后有一个announce-ip）、安全模式是关闭的。
+
+在ip为192.168.179.129的主机的7778端口再次开放一个除端口外同样配置的redis结点，尝试连接
+
+>ruby redis-4.0.8/src/redis-trib.rb add-node 192.168.179.129:7778 192.168.179.128:7000
+
+仍然显示为
+
+>[OK] New node added correctly.
+
+查看cluster nodes发现成功加入结点。
+
+```bash
+root@ubuntu:/home/fakeyw# redis-cli -h 192.168.179.128 -p 7000
+192.168.179.128:7000> cluster nodes
+6abb1cc5b10e40e831dd0eda9900f60072a3f35d 192.168.179.128:7004@17004 slave 27c35825805895deda38c34ffde65ccf630f035f 0 1520695346426 7 connected
+a1cf5bff7895650d67d7bf09ed05dbf2947d34a0 192.168.179.128:7000@17000 myself,master - 0 1520695347000 1 connected 0-5460
+663fd8e4c8fd23c6ed937deaf66339dc04b23020 192.168.179.129:7778@17778 master - 0 1520695345000 0 connected #这是动态加入的远程结点
+f985284ea6a9d4189d348e7fea454df836a6c3ff 192.168.179.128:7001@17001 master - 0 1520695347449 2 connected 10923-16383
+78cd852c36019b8ea17ce4f03c3af90fb3bf3c58 192.168.179.128:7002@17002 slave a1cf5bff7895650d67d7bf09ed05dbf2947d34a0 0 1520695345000 3 connected
+27c35825805895deda38c34ffde65ccf630f035f 192.168.179.129:7777@17777 master - 0 1520695345403 7 connected 5461-10922 #这时构建时加入的远程结点
+6b7b0ecbd1106c0178fa87b89afaacba78c9d879 192.168.179.128:7005@17005 slave f985284ea6a9d4189d348e7fea454df836a6c3ff 0 1520695348474 6 connected
+7d066691090762d927cffdb065d721bc2754eb43 192.168.179.128:7003@17003 slave a1cf5bff7895650d67d7bf09ed05dbf2947d34a0 0 1520695346000 4 connected
+```
+
+###### 公网结点
+
+---
 
 
 
