@@ -26,6 +26,8 @@ redis是一种存储结构类似Nosql的数据储存系统。
 
 ## Install & use Redis
 
+P.S. ：以下操作为尝试方便，在本地使用了root用户。在使用时最好使用限权用户进行操作。
+
 ###### 安装
 ---
 一般作为服务器常用ubuntu server/centos等linux系系统
@@ -447,9 +449,55 @@ f985284ea6a9d4189d348e7fea454df836a6c3ff 192.168.179.128:7001@17001 master - 0 1
 7d066691090762d927cffdb065d721bc2754eb43 192.168.179.128:7003@17003 slave a1cf5bff7895650d67d7bf09ed05dbf2947d34a0 0 1520695346000 4 connected
 ```
 
+P.S. ：远程结点所在宿主机不需要安装Ruby解释器，因为脚本起到的作用仅为向redis结点发送信号。
+
 ###### 公网结点
 
 ---
+
+暂缺，本地（无固定公网ip）结点 - 公网docker内结点 组建集群失败，但可以连接控制台（redis-cli）。
+
+配置：
+
+docker内结点
+
+dockers转发设置为 -p vps ip:vps port:container port (不一定是ssh连接的ip，一般是vps在eth0网络内的ip)
+
+据资料，redis总线端口也需要转发，但操作后仍然没能构建结点
+
+cluster-announce-ip 等设置后（多种组合） 也没能构建结点
+
+bind docker0网络ip 
+
+推测需要两台有相对固定ip的主机进行实验。
+
+###### 哨兵结点（sentinel）
+
+---
+
+sentinel结点与数据结点不同，其功能是对数据结点与其他sentinel结点进行监控。
+
+当发现一个结点不可达时，当前sentinel结点会给出Subjectively Down（简称SDOWN）标识
+
+sentinel结点相互交流后，当多数认为此结点(只能为主结点，其他结点下线不需要协商）SDOWN，则此结点Objectively Down（简称ODOWN）
+
+主节点ODOWN时，开始进行故障迁移。
+
+根据raft算法（之后会讨论），选出一个sentinel来主持主从切换。
+
+再在ODOWN主节点的从结点里选出一个从结点，切换为主节点，换下的主节点属性更改为从结点，再次上线时开始复制新的从结点。
+
+这种自动保持结点完整的特性为redis集群提供了高度可用性。
+
+## Source Code&Algorithm
+
+###### 源码
+
+---
+
+下载：[redis 4.0.8 源文件](http://download.redis.io/releases/redis-4.0.8.tar.gz)
+
+
 
 
 
