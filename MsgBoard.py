@@ -2,19 +2,28 @@ from flask import Flask
 import redis
 from urllib import parse
 
-r_conn = redis.Redis(host='192.168.179.128',port=6379,password='111111',db=0)
+r_conn = redis.Redis(host='xxx.xxx.xxx.xxx',port=7777,db=0)
 Mboard = Flask(__name__)
 
-@Mboard.route(methods=['GET'],'/')
+@Mboard.route('/',methods=['GET','POST'])
 def main_page():
-	msgs = r_conn.lrange('t_list',0,r_conn.llen('t_list')) #get all msg
+	print(1)
+	msgs = r_conn.lrange('msg_list',0,r_conn.llen('msg_list')) #get all msg
+	patt ='''
+	<div class='msg'>
+		{msg}
+	</div>
+	'''
+	resp = ''
+	for i in msgs:
+		resp+=patt.format(msg=i.decode('utf-8'))
 	return resp
 
-@Mboard.route(methods=['GET'],'/op')
+@Mboard.route('/op',methods=['GET'])
 def op_page():
-	return resp
+	return 0
 	
-@Mboard.route(methods=['POST'],'/add')
+@Mboard.route('/add',methods=['POST'])
 def add():
 	title = request.form['title']
 	content = request.form['ctt']
@@ -29,4 +38,4 @@ def add():
 [b'2', b'1']
 '''
 if __name__ == '__main__':
-    app.run(port=30000,debug=True)
+    Mboard.run(port=30000,debug=True)
