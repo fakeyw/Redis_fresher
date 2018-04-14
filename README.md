@@ -497,7 +497,195 @@ sentinel结点相互交流后，当多数认为此结点(只能为主结点，�
 
 下载：[redis 4.0.8 源文件](http://download.redis.io/releases/redis-4.0.8.tar.gz)
 
+（main函数在server.c中）
 
+源码阅读顺序推荐 （https://www.cnblogs.com/aixiaomei/p/6311633.html）
 
+1. 基本数据结构
 
+   1. 内存分配 zmalloc.c、zmalloc.h
+   2. 动态字符串 sds.h、sds.c
+   3. 双端链表 adlist.c、adlist.h
+   4. 字典 dict.h、dict.c
+   5. 跳跃表 server.h 中的zskiplist、zskiplistNode 结构，t_zset.c中所有zsl开头的函数
+   6. 日志类型 hyperloglog.c 中的 hllhdr结构、hll开头的函数
 
+2. 内存编码
+
+   1. 整数集合 intset.h、intset.c
+   2. 压缩列表 ziplist.h、ziplist.c
+
+3. redis数据类型
+
+   1. 对象系统 object.c
+   2. 字串键 t_string.c
+   3. 列表键 t_list.c
+   4. 散列键 hash.c
+   5. 集合键 t_set.c
+   6. 有序集合键 t_zset.c中除 zsl 开头的函数之外的所有函数
+   7. HyperLogLog键 hyperloglog.c中所有以pf开头的函数
+
+4. 数据库实现
+
+   1. redis.h redisDb结构、db.c
+   2. 通知 notify.c
+   3. RDB rdb.c
+   4. AOF aof.c
+   5. 发布-订阅 redis.h - pubsubPattern、pubsub.c
+   6. 事务 redis.h - multiState multiCmd、multi.c
+
+5. 双端实现
+
+   1. 事件处理 ae.c/ae_epoll.c/ae_evport.c/ae_kqueue.c/ae_select.c
+   2. 网络 anet.c、networking.c
+   3. 服务端 redis.c
+   4. 客户端 redis-cli.c
+   5. lua脚本 scripting.c
+   6. 慢查询 slowlog.c
+   7. 监视 monitor.c
+
+6. 集群功能
+
+   1. 复制 replication.c
+   2. 哨兵 sentinal.c
+   3. 集群 cluster.c
+
+7. 其他
+
+   暂略
+
+---
+
+以上为`3.2.5`版本的源码基本结构，而且有一些问题，比如并不存在的redis.c
+
+在当前使用的`4.0.8`中，暂时猜测服务端在server.c中，redis.h对应到server.h
+
+源码分析主要探究如下部分：
+
+- 数据类型
+- 内存/存储
+- 网络
+- 集群实现
+
+具体分析都以4.0.8稳定版作为标准
+
+---
+
+**内存（内存分配、编码）**
+
+**zmalloc.h**
+
+```c
+#if defined(USE_TCMALLOC)
+	#define ZMALLOC_LIB ("tcmalloc-" __xstr(TC_VERSION_MAJOR) "." __xstr(TC_VERSION_MINOR))
+	#include <google/tcmalloc.h>
+	#if (TC_VERSION_MAJOR == 1 && TC_VERSION_MINOR >= 6) || (TC_VERSION_MAJOR > 1)
+		#define HAVE_MALLOC_SIZE 1
+		#define zmalloc_size(p) tc_malloc_size(p)
+	#else
+		#error "Newer version of tcmalloc required"
+	#endif
+
+#elif defined(USE_JEMALLOC)
+	#define ZMALLOC_LIB ("jemalloc-" __xstr(JEMALLOC_VERSION_MAJOR) "." __xstr(JEMALLOC_VERSION_MINOR) "." __xstr(JEMALLOC_VERSION_BUGFIX))
+	#include <jemalloc/jemalloc.h>
+	#if (JEMALLOC_VERSION_MAJOR == 2 && JEMALLOC_VERSION_MINOR >= 1) || (JEMALLOC_VERSION_MAJOR > 2)
+		#define HAVE_MALLOC_SIZE 1
+		#define zmalloc_size(p) je_malloc_usable_size(p)
+	#else
+		#error "Newer version of jemalloc required"
+	#endif
+
+#elif defined(__APPLE__)
+	#include <malloc/malloc.h>
+	#define HAVE_MALLOC_SIZE 1
+	#define zmalloc_size(p) malloc_size(p)
+#endif
+```
+
+redis本身没有实现内存池，其内存分配方式在预编译时确定
+
+选择对象有libc的标准库、jemalloc与google的tcmalloc
+
+其中jemalloc依赖在源码的dep中存在，其相对于glibc的malloc的标准库的优势主要体现在避免内存碎片与并发扩展上
+
+而tcmalloc则需要主动安装才能使用
+
+```c
+#if defined(USE_TCMALLOC)
+	#define malloc(size) tc_malloc(size)
+	#define calloc(count,size) tc_calloc(count,size)
+	#define realloc(ptr,size) tc_realloc(ptr,size)
+	#define free(ptr) tc_free(ptr)
+#elif defined(USE_JEMALLOC)
+	#define malloc(size) je_malloc(size)
+	#define calloc(count,size) je_calloc(count,size)
+	#define realloc(ptr,size) je_realloc(ptr,size)
+	#define free(ptr) je_free(ptr)
+	#define mallocx(size,flags) je_mallocx(size,flags)
+	#define dallocx(ptr,flags) je_dallocx(ptr,flags)
+#endif
+```
+
+在zmalloc.c中
+
+根据预编译宏对malloc系列函数进行覆盖
+
+zmalloc()
+
+```c
+void *zmalloc(size_t size) {
+    void *ptr = malloc(size+PREFIX_SIZE); 
+    if (!ptr) zmalloc_oom_handler(size); //未成功分配空间时报错并退出
+#ifdef HAVE_MALLOC_SIZE
+    update_zmalloc_stat_alloc(zmalloc_size(ptr));
+    return ptr;
+#else
+    *((size_t*)ptr) = size;
+    update_zmalloc_stat_alloc(size+PREFIX_SIZE);
+    return (char*)ptr+PREFIX_SIZE; //将指针向右偏移到可用内存块
+#endif
+}
+```
+
+分配长度要在size上加一个PREFIX_SIZE，根据平台不同确定是否在内存头部写入这块内存的大小
+
+其中PREFIX_SIZE的定义为
+
+```c
+#ifdef HAVE_MALLOC_SIZE //HAVE_MALLOC_SIZE用来确定系统是否有函数malloc_size,在zmalloc.h中定义
+	#define PREFIX_SIZE (0)
+#else
+	#if defined(__sun) || defined(__sparc) || defined(__sparc__)
+		#define PREFIX_SIZE (sizeof(long long)) //Solaris
+	#else
+		#define PREFIX_SIZE (sizeof(size_t))	//others
+	#endif
+#endif
+```
+
+zmalloc中使用到的 update_zmalloc_stat_alloc() 宏函数
+
+```c
+#define update_zmalloc_stat_alloc(__n) do { \
+    size_t _n = (__n); \
+    if (_n&(sizeof(long)-1)) _n += sizeof(long)-(_n&(sizeof(long)-1)); \
+    atomicIncr(used_memory,__n); \
+} while(0)
+```
+
+if后面那一长串操作
+
+跟进一下atomicIncr，是个获取/释放互斥锁的操作
+
+(在atomicvar.h中定义的atomic*系列函数都是需要获取锁的原子操作)
+
+```c
+#define atomicIncr(var,count) do { \
+    pthread_mutex_lock(&var ## _mutex); \
+    var += (count); \
+    pthread_mutex_unlock(&var ## _mutex); \
+} while(0)
+```
+
+update_zmalloc_stat_alloc的作用就是增加已分配的内存大小的记录
