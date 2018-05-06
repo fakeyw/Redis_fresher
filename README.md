@@ -1,4 +1,6 @@
-## Redis急速入门日志
+# Redis急速入门日志
+
+[TOC]
 
 ## About Redis 
 

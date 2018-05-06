@@ -1,8 +1,10 @@
 # Memory&Storage
 
+[TOC]
+
 #### 内存
 
-**00x01 zmalloc 内存分配** 
+##### 00x01 zmalloc 内存分配 
 
 ---
 
@@ -304,7 +306,7 @@ size_t zmalloc_get_rss(void) {
 
 
 
-**00x02 ziplist 压缩列表**
+##### 00x02 ziplist 压缩列表
 
 ---
 
@@ -869,3 +871,324 @@ unsigned char *ziplistMerge(unsigned char **first, unsigned char **second) {
 
 
 
+##### 00x03 skiplist 跳跃表
+
+---
+
+skiplist的数据实现定义在t_zset.c中，以zsl开头的函数为相关函数
+
+跳跃表时以链表为基础改进的，结点的next指针可以有多个，除了指向临近的下一个外还可指向越过多个节点的后方节点，这样有序链表中查找时就有很大可能跳过中间多个节点，快速接近想要定位的节点
+
+图示跳跃表能将链表查找所需时间降低到O(n/2)
+
+<img src='/skiplist_div2.png' />
+
+>Skip lists  are data structures  that use probabilistic  balancing rather  than  strictly  enforced balancing. As a result, the algorithms  for insertion  and deletion in skip lists  are much simpler and significantly  faster  than  equivalent  algorithms  for balanced trees.
+>
+>跳跃表使用概率均衡技术而不是使用强制性均衡，因此，对于插入和删除结点比传统上的平衡树算法更为简洁高效。
+
+跳跃表可以粗略地理解为多层的链表，其底层是包含所有元素的有序链表。
+
+每向多一层，就从下层元素中拿出头尾与随机选出的部分元素，并将其以指针连接。
+
+<img src='/skiplist_divR.png' />
+
+这也是skiplist被解释为probabilistic  balancing的原因
+
+**Redis中的skiplist实现**
+
+定义结构
+
+节点中嵌套定义了一个zskiplistlevel的结构，用于存储某一层后继节点的地址与本层两节点之间的跨度
+
+```c
+//server.h
+typedef struct zskiplistNode {
+    sds ele; //sds类型 在sds.h中定义 'typedef char *sds;' 即字符串指针
+    double score;
+    struct zskiplistNode *backward; //前驱，只存在于最底层
+    struct zskiplistLevel {
+        struct zskiplistNode *forward; //后继
+        unsigned int span; //节点跨度
+    } level[]; //不定层级
+} zskiplistNode;
+
+typedef struct zskiplist {
+    struct zskiplistNode *header, *tail;
+    unsigned long length;
+    int level;
+} zskiplist;
+```
+
+> 关于 span ：指的是本节点到下一节点跟随指针走过的节点数，如头节点所有层span都为1
+
+节点操作
+
+`zslCreateNode()` `zslFreeNode()`
+
+```c
+zskiplistNode *zslCreateNode(int level, double score, sds ele) {
+    zskiplistNode *zn =
+        zmalloc(sizeof(*zn)+level*sizeof(struct zskiplistLevel));
+    zn->score = score;			//按照节点所需层级分配空间
+    zn->ele = ele;
+    return zn;
+}
+
+void zslFreeNode(zskiplistNode *node) {
+    sdsfree(node->ele);
+    zfree(node);
+}
+```
+
+跳跃表创建
+
+这里只创建了单层链表，没有进一步创建跳跃结构
+
+```c
+#define ZSKIPLIST_MAXLEVEL 32 /* Should be enough for 2^32 elements */
+zskiplist *zslCreate(void) {
+    int j;
+    zskiplist *zsl;
+
+    zsl = zmalloc(sizeof(*zsl));
+    zsl->level = 1;
+    zsl->length = 0;
+    zsl->header = zslCreateNode(ZSKIPLIST_MAXLEVEL,0,NULL);
+    //创建一个32层的节点
+    for (j = 0; j < ZSKIPLIST_MAXLEVEL; j++) {
+        zsl->header->level[j].forward = NULL;	//初始化后继指针
+        zsl->header->level[j].span = 0;			//跨度初始化为0
+    }
+    zsl->header->backward = NULL;
+    zsl->tail = NULL;
+    return zsl;
+}
+```
+
+插入节点，涉及更高一层的创建
+
+skiplist是一个有序链表，而这里的排序依据为score
+
+```c
+zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+    unsigned int rank[ZSKIPLIST_MAXLEVEL];
+    int i, level;
+
+    serverAssert(!isnan(score));
+    x = zsl->header;
+    //在每一层找到新节点的插入位置，是否插入不确定
+    for (i = zsl->level-1; i >= 0; i--) {	//最高层开始逐层遍历
+        /* store rank that is crossed to reach the insert position */
+        rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];//最外层rank初始为0，之后初始值继承上层rank
+        while (x->level[i].forward && 					//指针非空
+                (x->level[i].forward->score < score ||	  //当前指向节点的下一节点的score较小
+                    (x->level[i].forward->score == score && 
+                    sdscmp(x->level[i].forward->ele,ele) < 0))) //score相等但携带信息不同
+        {	
+            rank[i] += x->level[i].span; 
+            x = x->level[i].forward;	//继续指向本层下一节点
+        }
+        //每层循环结束时，x指向的节点后方就是新节点的位置，每层的位置保存在update中
+        //而rank[i]则累加到x指向节点的前一个节点的span
+        //x前驱节点与头节点的距离
+        update[i] = x;
+        //这里不需要将x重新指向首部，可以在节点更密集的较下一层继续寻找位置
+        //而这个位置必然在本轮的x与其后继节点之间
+    }
+    /* we assume the element is not already inside, since we allow duplicated
+     * scores, reinserting the same element should never happen since the
+     * caller of zslInsert() should test in the hash table if the element is
+     * already inside or not. zslInsert() 的调用者会确保同分值且同成员的元素不会出现 */
+    level = zslRandomLevel(); //据幂次定律得出一个层数，作为新节点的层数，并不影响其他节点
+    if (level > zsl->level) {	//有新层出现时（可能不只一层）
+        for (i = zsl->level; i < level; i++) {
+            rank[i] = 0;	//初始化新层所需信息
+            update[i] = zsl->header;
+            update[i]->level[i].span = zsl->length;
+        }
+        zsl->level = level; //更新skiplist的最高层级
+    }
+    x = zslCreateNode(level,score,ele);
+    for (i = 0; i < level; i++) { //在x与其后继间插入新节点
+        x->level[i].forward = update[i]->level[i].forward;
+        update[i]->level[i].forward = x;
+
+        /* update span covered by update[i] as x is inserted here */
+        //update[i]->level[i].span为原跨度，包括前驱到x、x到后继的长度
+        //|rank[0] - rank[i]|为x实际位置(底层)前驱与本层前驱的差值，相减为x到后继在本层实际的span
+        x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
+        //更新x前驱结点span
+        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+    }
+
+    /* increment span for untouched levels */
+    for (i = level; i < zsl->level; i++) {
+        update[i]->level[i].span++;
+        //因为x的level为随机，可能有一些层不存在x元素，但跨度已经变更，所以需要更新
+    }
+
+    //更新前驱指针
+    x->backward = (update[0] == zsl->header) ? NULL : update[0];
+    if (x->level[0].forward)
+        x->level[0].forward->backward = x;
+    else
+        zsl->tail = x;
+    zsl->length++;
+    return x;
+}
+```
+
+其中获取随机level的函数
+
+```c
+#define ZSKIPLIST_MAXLEVEL 32 /* Should be enough for 2^32 elements */
+#define ZSKIPLIST_P 0.25      /* Skiplist P = 1/4 */
+int zslRandomLevel(void) {
+    int level = 1;
+    while ((random()&0xFFFF) < (ZSKIPLIST_P * 0xFFFF))
+        level += 1;
+    return (level<ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
+}
+```
+
+设ZSKIPLIST_P = a，达到后一层的概率都为a，则达到本层(不是等于)的概率：
+
+| 层数(x) | 概率p(x) |
+| :-----: | :------: |
+|    1    |    1     |
+|    2    |    a     |
+|    3    |   a^2    |
+|    4    |   a^3    |
+|   ...   |   ...    |
+|    k    | a^(k-1)  |
+
+$$
+\begin{align}
+PointerCost &= \sum_\infty^1p(x)\\
+&=\sum_\infty^1a^{x-1}\\
+&=\lim_{x\overrightarrow{}\infty}1+a+a^2+\cdots+a^{x-1}\\
+&=\lim_{x\overrightarrow{}\infty}\frac{1-a^x}{1-a}\\
+&=\frac{1}{1-a}
+\end{align}
+$$
+
+redis中默认设置p为0.25，则每个节点约占有1.33个指针(不包括前驱)，内存空间额外消耗较小，同时也有效提高了搜索速度。
+
+删除操作
+
+```c
+void zslDeleteNode(zskiplist *zsl, zskiplistNode *x, zskiplistNode **update) {
+    int i;	//x是要删除的节点
+    for (i = 0; i < zsl->level; i++) { //逐层遍历更新update节点(删除节点的前节点)信息
+        if (update[i]->level[i].forward == x) {
+            update[i]->level[i].span += x->level[i].span - 1;
+            update[i]->level[i].forward = x->level[i].forward;
+        } else {
+            update[i]->level[i].span -= 1;
+        }
+    }
+    if (x->level[0].forward) {	//补全前驱指针
+        x->level[0].forward->backward = x->backward;
+    } else {
+        zsl->tail = x->backward;
+    }
+    while(zsl->level > 1 && zsl->header->level[zsl->level-1].forward == NULL)
+        zsl->level--;	//更新层级
+    zsl->length--;
+}
+
+int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node) {
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+    int i;
+
+    x = zsl->header;	//从顶层开始遍历，找出每层要删除节点的前驱
+    for (i = zsl->level-1; i >= 0; i--) {
+        while (x->level[i].forward &&
+                (x->level[i].forward->score < score ||
+                    (x->level[i].forward->score == score &&
+                     sdscmp(x->level[i].forward->ele,ele) < 0)))
+        {
+            x = x->level[i].forward;
+        }
+        update[i] = x;
+    }
+    /* We may have multiple elements with the same score, what we need
+     * is to find the element with both the right score and object. */
+    x = x->level[0].forward; //将x修正指向要删除的节点
+    if (x && score == x->score && sdscmp(x->ele,ele) == 0) {
+        zslDeleteNode(zsl, x, update);
+        if (!node)
+            zslFreeNode(x);
+        else
+            *node = x;
+        return 1;
+    }
+    return 0; /* not found */
+}
+```
+
+区间操作(之一)  按score区间删除
+
+```c
+typedef struct {	//range定义结构
+    double min, max;
+    int minex, maxex; /* are min or max exclusive? */
+} zrangespec;
+
+unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, dict *dict) {
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+    unsigned long removed = 0;
+    int i;
+
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {	//记录要删除的一组节点中，第一个节点的前驱
+        while (x->level[i].forward && (range->minex ?
+            x->level[i].forward->score <= range->min :
+            x->level[i].forward->score < range->min))
+                x = x->level[i].forward;
+        update[i] = x;
+    }
+
+    /* Current node is the last with score < or <= min. */
+    x = x->level[0].forward;	//修正x指向第一个要删除的节点
+
+    /* Delete nodes while in range. */
+    while (x &&	//逐个向后删除
+           (range->maxex ? x->score < range->max : x->score <= range->max))
+    {
+        zskiplistNode *next = x->level[0].forward;
+        zslDeleteNode(zsl,x,update);
+        dictDelete(dict,x->ele);
+        zslFreeNode(x); /* Here is where x->ele is actually released. */
+        removed++;
+        x = next;
+    }
+    return removed; //返回值为删除节点的数量
+}
+```
+
+#### 存储
+
+##### 00x04 数据库实现
+
+---
+
+建议先看数据类型
+
+##### 00x05 RDB持久化
+
+---
+
+
+
+##### 00x06 AOF持久化
+
+---
+
+
+
+1. redis.h redisDb结构、db.c *
+2. RDB rdb.c *
+3. AOF aof.c *
