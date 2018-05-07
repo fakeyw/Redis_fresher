@@ -576,7 +576,7 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
         return;
     }
     setKey(c->db,key,val);	//保存键值对
-    server.dirty++;			//增加数据库的dirty值，作为持久化的参考指标
+    server.dirty++;			//增加数据库的dirty值，作为触发持久化的参考指标
     if (expire) setExpire(c,c->db,key,mstime()+milliseconds);//设置过期时间
     notifyKeyspaceEvent(NOTIFY_STRING,"set",key,c->db->id);//发送set事件通知
     if (expire) notifyKeyspaceEvent(NOTIFY_GENERIC,
@@ -775,20 +775,27 @@ robj *createZiplistObject(void) {
 在t_list.c中定义了list结构的一系列操作，作为命令的基础
 
 ```c
-void listTypeTryConversion(robj *subject, robj *value);
-void listTypePush(robj *subject, robj *value, int where); // PUSH底层实现
-robj *listTypePop(robj *subject, int where); // POP底层实现
-unsigned long listTypeLength(robj *subject); // 返回entry节点个数
-// 初始化列表类型的迭代器为一个指定的下标
+//list结构PUSH操作
+void listTypePush(robj *subject, robj *value, int where); 
+//POP
+robj *listTypePop(robj *subject, int where); 
+//返回entry节点个数
+unsigned long listTypeLength(robj *subject); 
+//初始化list迭代器到一个指定下标
 listTypeIterator *listTypeInitIterator(robj *subject, long index, unsigned char direction);
-void listTypeReleaseIterator(listTypeIterator *li); // 释放迭代器空间
-// 将列表类型的迭代器指向的entry保存在提供的listTypeEntry结构中，并且更新迭代器，1表示成功，0失败
+//释放迭代器空间
+void listTypeReleaseIterator(listTypeIterator *li); 
+//读取迭代器当前指向的entry到listTypeEntry中
 int listTypeNext(listTypeIterator *li, listTypeEntry *entry);
-robj *listTypeGet(listTypeEntry *entry); // 根据迭代器当前的指向返回value对象
-void listTypeInsert(listTypeEntry *entry, robj *value, int where); // 插入value到where位置
-int listTypeEqual(listTypeEntry *entry, robj *o); //判断节点
-void listTypeDelete(listTypeIterator *iter, listTypeEntry *entry); // 删除迭代器当前指向的节点
-// 转换ZIPLIST编码类型为quicklist类型，encoding变为OBJ_ENCODING_QUICKLIST
+//根据entry返回value对象
+robj *listTypeGet(listTypeEntry *entry); 
+//插入value到where的位置
+void listTypeInsert(listTypeEntry *entry, robj *value, int where); 
+//判断当前entry与o的内容是否相等
+int listTypeEqual(listTypeEntry *entry, robj *o); 
+//删除迭代器当前指向的节点
+void listTypeDelete(listTypeIterator *iter, listTypeEntry *entry); 
+//转换ZIPLIST编码类型为quicklist类型，encoding变为OBJ_ENCODING_QUICKLIST
 void listTypeConvert(robj *subject, int enc);
 ```
 
@@ -796,7 +803,7 @@ listTypeIterator内包含的是quicklist的迭代器与list的信息
 
 listTypeEntry则包含了quicklistEntry
 
-关于entry，list与quicklist的entry实际上是ziplist的entry，在存储空间中为连续的内存块，在修改这个内存块之前要先将其信息读出来。在ziplist中这个结构为ziplistEntry，这里的quicklistEntry与ziplist功能相同，只不过为了适应quicklist而定义了新的结构。
+关于entry，list与quicklist的entry实际上是ziplist的entry，在存储空间中为连续的内存块，在修改这个内存块之前要先将其信息读出来。在ziplist中这个结构为zlEntry，这里的quicklistEntry与ziplist功能相同，只不过为了适应quicklist而定义了新的结构。
 
 ```c
 typedef struct {
@@ -812,13 +819,362 @@ typedef struct {
 } listTypeEntry;
 ```
 
+比较难懂的是quicklistEntry结构中的zi指针
 
+```c
+typedef struct quicklistEntry {
+    const quicklist *quicklist;
+    quicklistNode *node;		//所属的节点(一个节点包含一条zl的多个entry)
+    unsigned char *zi;			//???
+    unsigned char *value;		//读出的值(字符串)
+    long long longval;			//值(整数)
+    unsigned int sz;		//字节大小
+    int offset;				//相对ziplist的偏移量
+} quicklistEntry;
+
+int listTypeEqual(listTypeEntry *entry, robj *o) {
+    if (entry->li->encoding == OBJ_ENCODING_QUICKLIST) {
+        //确保o->ptr的encoding是string类型的RAW/EMBSTR
+        //从这里可以推断出entry->entrt.zi也应当是相同的类型
+        //所以quicklistEntry中的zi应该指向ziplist中的entry内存块而不是ziplist
+        serverAssertWithInfo(NULL,o,sdsEncodedObject(o));
+        return quicklistCompare(entry->entry.zi,o->ptr,sdslen(o->ptr));
+    } else {
+        serverPanic("Unknown list encoding");
+    }
+}
+```
 
 ##### 命令实现
 
+> list与其他类型的命令不同的是，`B-`(blocking)类命令如BLPOP是阻塞的，其他命令为非阻塞执行
 
+之前给出的一系列函数是直接对quicklist操作，是list底层操作的实现，而不是list命令底层操作的实现
 
+在命令中要考虑到原子操作、事务、脏键等必要元素
 
+push类命令底层实现，包括LPUSH，RPUSH
+
+```c
+//where表示push的位置
+void pushGenericCommand(client *c, int where) {
+    int j, pushed = 0;
+    robj *lobj = lookupKeyWrite(c->db,c->argv[1]); //以写操作获取list对象
+	
+    //obj存在但不是list，向客户端发送错误信息并结束
+    if (lobj && lobj->type != OBJ_LIST) {
+        addReply(c,shared.wrongtypeerr);
+        return;
+    }
+	
+    //从c->argv中第一个'value'开始遍历
+    for (j = 2; j < c->argc; j++) {
+        if (!lobj) {//不存在list时创建list对象
+            lobj = createQuicklistObject();
+            //设置list-quicklist中ziplist的最大长度与压缩
+            quicklistSetOptions(lobj->ptr, server.list_max_ziplist_size,
+                                server.list_compress_depth);
+            //向数据库中存入键值对(列表名):(新列表对象)
+            dbAdd(c->db,c->argv[1],lobj);
+        }
+        //调用listType基本操作，插入对象，where直接传入由listTypePush处理
+        listTypePush(lobj,c->argv[j],where);
+        //记录本次执行已存入数
+        pushed++;
+    }
+    //发送消息、信号、事件
+    addReplyLongLong(c, (lobj ? listTypeLength(lobj) : 0));
+    if (pushed) {
+        //确认事件类型
+        char *event = (where == LIST_HEAD) ? "lpush" : "rpush";
+
+        signalModifiedKey(c->db,c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
+    }
+    //更新脏键
+    server.dirty += pushed;
+}
+```
+
+`pushxGenericCommand()`与`pushGenericCommand()`不同，只对已存在的list有效，不会创建新list
+
+```c
+void pushxGenericCommand(client *c, int where) {
+    int j, pushed = 0;
+    robj *subject;
+	
+    //不存在或类型不同就向客户端发送错误信息
+    if ((subject = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,subject,OBJ_LIST)) return;
+
+    for (j = 2; j < c->argc; j++) {
+        listTypePush(subject,c->argv[j],where);
+        pushed++;
+    }
+
+    addReplyLongLong(c,listTypeLength(subject));
+
+    if (pushed) {
+        char *event = (where == LIST_HEAD) ? "lpush" : "rpush";
+        signalModifiedKey(c->db,c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
+    }
+    server.dirty += pushed;
+}
+```
+
+非阻塞POP底层实现
+
+```c
+void popGenericCommand(client *c, int where) {
+    //以写操作获取对象，与lookupKeyWrite不同的是，
+    //lookupKeyWriteOrReply检测到key对应对象不存在时会向客户端发送消息
+    robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nullbulk);	
+    if (o == NULL || checkType(c,o,OBJ_LIST)) return;
+	
+    //按照where弹出一个值
+    robj *value = listTypePop(o,where);
+    if (value == NULL) {
+        //值为空则发送‘空’消息
+        addReply(c,shared.nullbulk);
+    } else {
+        char *event = (where == LIST_HEAD) ? "lpop" : "rpop";
+
+        addReplyBulk(c,value);
+        decrRefCount(value);	//引用计数-1
+        //发送通知
+        notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
+        //列表为空时删除list的键值对
+        if (listTypeLength(o) == 0) {
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
+                                c->argv[1],c->db->id);
+            dbDelete(c->db,c->argv[1]);
+        }
+        //发送键被改动的信号
+        signalModifiedKey(c->db,c->argv[1]);
+        server.dirty++;	//更新脏键
+    }
+}
+```
+
+INSERT命令则是单独用一个函数来实现的
+
+```c
+void linsertCommand(client *c) {
+    int where;
+    robj *subject;
+    listTypeIterator *iter;
+    listTypeEntry entry;
+    int inserted = 0;
+    
+	//命令格式 LINSERT key BEFORE|AFTER pivot value
+    //如 LINSERT namelist BEFORE "Alice" "Bob" 在"Alice"前方置入"Bob"
+    if (strcasecmp(c->argv[2]->ptr,"after") == 0) {
+        where = LIST_TAIL;
+    } else if (strcasecmp(c->argv[2]->ptr,"before") == 0) {
+        where = LIST_HEAD;
+    } else {
+        //发送消息，命令格式错误
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+    
+	//与PUSHX类型，同样只对已有列表有效
+    if ((subject = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,subject,OBJ_LIST)) return;
+
+    /* Seek pivot from head to tail */
+    //创建一个subject(当前操作列表)的迭代器
+    iter = listTypeInitIterator(subject,0,LIST_TAIL);
+    while (listTypeNext(iter,&entry)) {
+        //遍历查找基准值(如上面示例中的"Alice")位置
+        if (listTypeEqual(&entry,c->argv[3])) {
+            //在基准位置前/后插入元素
+            listTypeInsert(&entry,c->argv[4],where);
+            inserted = 1;//已插入
+            break;
+        }
+    }
+    listTypeReleaseIterator(iter);
+	
+    //插入成功
+    if (inserted) {
+        signalModifiedKey(c->db,c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_LIST,"linsert",
+                            c->argv[1],c->db->id);
+        server.dirty++;
+    //插入失败
+    } else {
+        /* Notify client of a failed insert */
+        addReply(c,shared.cnegone);
+        return;
+    }
+
+    addReplyLongLong(c,listTypeLength(subject));
+}
+```
+
+阻塞POP底层实现(BRPOPLPUSH是单独实现的)
+
+> 阻塞命令包括BLPOP，BRPOP和BRPOPLPUSH
+
+在list为空时，调用此命令的client会处于阻塞状态
+
+```c
+void blockingPopGenericCommand(client *c, int where) {
+    robj *o;
+    mstime_t timeout;
+    int j;
+	
+    //以秒为单位获取超时时长存储在timeout中
+    if (getTimeoutFromObjectOrReply(c,c->argv[c->argc-1],&timeout,UNIT_SECONDS)
+        != C_OK) return;
+
+    for (j = 1; j < c->argc-1; j++) {
+        o = lookupKeyWrite(c->db,c->argv[j]);
+        if (o != NULL) {
+            if (o->type != OBJ_LIST) {
+                addReply(c,shared.wrongtypeerr);
+                return;
+            } else {
+                if (listTypeLength(o) != 0) {
+                    /* Non empty list, this is like a non normal [LR]POP. */
+                    char *event = (where == LIST_HEAD) ? "lpop" : "rpop";
+                    robj *value = listTypePop(o,where);
+                    serverAssert(value != NULL);
+
+                    addReplyMultiBulkLen(c,2);
+                    addReplyBulk(c,c->argv[j]);
+                    addReplyBulk(c,value);
+                    decrRefCount(value);
+                    notifyKeyspaceEvent(NOTIFY_LIST,event,
+                                        c->argv[j],c->db->id);
+                    if (listTypeLength(o) == 0) {
+                        dbDelete(c->db,c->argv[j]);
+                        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
+                                            c->argv[j],c->db->id);
+                    }
+                    signalModifiedKey(c->db,c->argv[j]);
+                    server.dirty++;
+
+                    /* Replicate it as an [LR]POP instead of B[LR]POP. */
+                    rewriteClientCommandVector(c,2,
+                        (where == LIST_HEAD) ? shared.lpop : shared.rpop,
+                        c->argv[j]);
+                    return;
+                }
+            }
+        }
+    }
+	//如果这条命令在一个事务中，则向客户端发送一个空回复
+    /* If we are inside a MULTI/EXEC and the list is empty the only thing
+     * we can do is treating it as a timeout (even with timeout 0). */
+    if (c->flags & CLIENT_MULTI) {
+        addReply(c,shared.nullmultibulk);
+        return;
+    }
+    
+    //前面的操作都属于非阻塞操作，真正实现阻塞的是下面的函数
+	//如果参数中的所有键在list中都不存在则阻塞
+    /* If the list is empty or the key does not exists we must block */
+    //c->argv+1 修正数组首地址到第一个key处
+    //c->argc-2 key的数量
+    blockForKeys(c, c->argv + 1, c->argc - 2, timeout, NULL);
+}
+
+//target是push的元素，用于BRPOPLPUSH
+void blockForKeys(client *c, robj **keys, int numkeys, mstime_t timeout, robj *target) {
+    dictEntry *de;
+    list *l;
+    int j;
+	
+    //因为是客户端为主体的阻塞操作，可以直接设置到客户端的参数中
+    c->bpop.timeout = timeout;
+    c->bpop.target = target;
+	
+    //操作期间增加target的引用计数
+    if (target != NULL) incrRefCount(target);
+	
+    //遍历所有键
+    for (j = 0; j < numkeys; j++) {
+        /* If the key already exists in the dict ignore it. */
+        //bpop.keys用于记录所有造成client阻塞的键，是一个dict结构
+        if (dictAdd(c->bpop.keys,keys[j],NULL) != DICT_OK) continue;
+        incrRefCount(keys[j]);
+        //之前在append命令中提到过，c->argv不是实际的命令行内容，而是处理成了robj类型
+        //所以才有引用计数这一属性
+
+        /* And in the other "side", to map keys -> clients */
+        //c->db->blocking_keys是一个dict，
+        //其中的key为造成client阻塞的键，value为保存着所有被该键阻塞的client的链表
+        de = dictFind(c->db->blocking_keys,keys[j]);//寻找这个键对应的链表
+        if (de == NULL) {
+            //没有找到则创建新的链表，并将其加入bilocking_keys
+            int retval;
+            /* For every key we take a list of clients blocked for it */
+            l = listCreate();
+            retval = dictAdd(c->db->blocking_keys,keys[j],l);
+            incrRefCount(keys[j]);
+            serverAssertWithInfo(c,keys[j],retval == DICT_OK);
+        } else {
+            //有则获取这个链表的引用
+            l = dictGetVal(de);
+        }
+        //向这个链表加入新的阻塞client记录
+        listAddNodeTail(l,c);
+    }
+    //阻塞client
+    //BLOCK_LIST = 1 表示在阻塞列表中
+    blockClient(c,BLOCKED_LIST);
+}
+
+//blocked.c
+//修改阻塞状态与标志
+void blockClient(client *c, int btype) {
+    c->flags |= CLIENT_BLOCKED;
+    c->btype = btype;
+    server.bpop_blocked_clients++;
+}
+
+//c->bpop 是 blockingStats结构，定义在server.h中
+typedef struct blockingState {
+    /* Generic fields. */
+    mstime_t timeout;       /* Blocking operation timeout. If UNIX current time
+                             * is > timeout then the operation timed out. */
+
+    /* BLOCKED_LIST */
+    dict *keys;             /* The keys we are waiting to terminate a blocking
+                             * operation such as BLPOP. Otherwise NULL. */
+    robj *target;           /* The key that should receive the element,
+                             * for BRPOPLPUSH. */
+
+    /* BLOCKED_WAIT */
+    int numreplicas;        /* Number of replicas we are waiting for ACK. */
+    long long reploffset;   /* Replication offset to reach. */
+
+    /* BLOCKED_MODULE */
+    void *module_blocked_handle; /* RedisModuleBlockedClient structure.
+                                    which is opaque for the Redis core, only
+                                    handled in module.c. */
+} blockingState;
+
+//c->db 是 redisDb结构，定义在server.h中
+typedef struct redisDb {
+    dict *dict;                 /* The keyspace for this DB */
+    dict *expires;              /* Timeout of keys with a timeout set */
+    dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP)*/
+    dict *ready_keys;           /* Blocked keys that received a PUSH */
+    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+    int id;                     /* Database ID */
+    long long avg_ttl;          /* Average TTL, just for stats */
+} redisDb;
+```
+
+redis中实现的阻塞是修改客户端的状态，而解阻塞的正常触发一般有两种
+
+一种根据timeout等待超时，另一种是另一个客户端对记录blocking的key(list对应的key)的任意一个执行LPUSH或RPUSH命令时
+
+在server.c的processCommand(执行命令)函数的最后，根据server.ready_keys是否有元素来调用t_list.c中的handleClientsBlockedOnLists(void)函数，解除client的阻塞状态
 
 #### 00x05 hash
 
@@ -826,7 +1182,7 @@ typedef struct {
 
 ##### 数据实现
 
-默认创建对象为ziplist结构，dict类型的hash对象是在数据量达到配置中限制的值后通过转换获得的
+默认创建对象为ziplist结构，dict类型的hash对象是在键值对大小(ziplist节点大小或键值对数量(ziplist节点数)达到配置中限制的值后通过转换得到的
 
 redis.conf
 
@@ -846,11 +1202,177 @@ robj *createHashObject(void) {
 }
 ```
 
+类似list类型，hash也对基本操作做了一层封装
+
+```c
+//在必要的情况下转换encoding为HT(函数内有检测)
+void hashTypeTryConversion(robj *subject, robj **argv, int start, int end);
+//从encoding为ziplist的hash对象中获取value信息，保存到vstr,vlen,vll中
+int hashTypeGetFromZiplist(robj *o, sds field,unsigned char **vstr,unsigned int *vlen,long long *vll)
+//从encoding为HT的hash对象中获取value对象，返回简单动态字符串
+sds hashTypeGetFromHashTable(robj *o, sds field)
+//判断encoding，调用上面两个函数，获取value信息
+int hashTypeGetValue(robj *o, sds field, unsigned char **vstr, unsigned int *vlen, long long *vll)
+//根据在GetValue基础上用value信息创建value对象
+robj *hashTypeGetValueObject(robj *o, sds field)
+//value长度，0为不存在
+size_t hashTypeGetValueLength(robj *o, sds field)
+//判断hash对象中key是否存在
+int hashTypeExists(robj *o, robj *key);
+//设置k-v
+int hashTypeSet(robj *o, robj *key, robj *value);
+//删除k-v 
+int hashTypeDelete(robj *o, robj *key);
+//返回键值对个数
+unsigned long hashTypeLength(robj *o);
+//返回一个初始化的hash类型迭代器
+hashTypeIterator *hashTypeInitIterator(robj *subject);
+//释放迭代器空间
+void hashTypeReleaseIterator(hashTypeIterator *hi);
+//迭代器指向下个节点
+int hashTypeNext(hashTypeIterator *hi);
+//类似hashTypeGetFromZiplist，这个是适用于迭代器的
+void hashTypeCurrentFromZiplist(hashTypeIterator *hi, int what, unsigned char **vstr, unsigned int *vlen, long long *vll);
+//同上，类似hashTypeGetFromHashTable
+void hashTypeCurrentFromHashTable(hashTypeIterator *hi, int what, robj **dst);
+//类似hashTypeGetValueObject
+robj *hashTypeCurrentObject(hashTypeIterator *hi, int what);
+//以sds类型返回当前元素
+sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what)
+//以写操作查找key对应的hash对象，如果不存在则创建
+robj *hashTypeLookupWriteOrCreate(client *c, robj *key);
+//转换encoding为ziplist
+void hashTypeConvertZiplist(robj *o, int enc)
+//转换一个hashobj的encoding，enc为新编码类型
+void hashTypeConvert(robj *o, int enc);
+```
+
 ##### 命令实现
+
+
+HSET,HGET,HINCRBY,HLEN等命令基本都是执行hash对象的基本操作加上信号，反馈与记录
+
+HINCRBYFLOAT实现
+
+```c
+void hincrbyfloatCommand(client *c) {
+    long double value, incr;
+    long long ll;
+    robj *o;
+    sds new;
+    unsigned char *vstr;
+    unsigned int vlen;
+	
+    //从命令获取长双浮点数类型的增量存入incr
+    if (getLongDoubleFromObjectOrReply(c,c->argv[3],&incr,NULL) != C_OK) return;
+    //写操作取出hash对象，或创建新hash对象
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    //读取目标对象信息，并检查是否为浮点数类型
+    if (hashTypeGetValue(o,c->argv[2]->ptr,&vstr,&vlen,&ll) == C_OK) {
+        if (vstr) {
+            if (string2ld((char*)vstr,vlen,&value) == 0) {
+                addReplyError(c,"hash value is not a float");
+                return;
+            }
+        } else {
+            value = (long double)ll;
+        }
+    } else {//没有这一对象则默认值为0
+        value = 0;
+    }
+	
+    //计算新值
+    value += incr;
+    char buf[256];
+    int len = ld2string(buf,sizeof(buf),value,1); //浮点数转字符数组
+    new = sdsnewlen(buf,len);	//字符串转sds
+    hashTypeSet(o,c->argv[2]->ptr,new,HASH_SET_TAKE_VALUE); //更新key的对象
+    addReplyBulkCBuffer(c,buf,len); //将新值返回给客户端
+    signalModifiedKey(c->db,c->argv[1]);
+    notifyKeyspaceEvent(NOTIFY_HASH,"hincrbyfloat",c->argv[1],c->db->id);
+    server.dirty++;
+
+    /* Always replicate HINCRBYFLOAT as an HSET command with the final value
+     * in order to make sure that differences in float pricision or formatting
+     * will not create differences in replicas or after an AOF restart. */
+    //修改当前命令为HSET，避免AOF恢复时不同浮点精度造成的误差
+    //不会执行，只在记录中代替
+    robj *aux, *newobj;
+    aux = createStringObject("HSET",4);
+    newobj = createRawStringObject(buf,len);
+    rewriteClientCommandArgument(c,0,aux);
+    decrRefCount(aux);
+    rewriteClientCommandArgument(c,3,newobj);
+    decrRefCount(newobj);
+}
+```
+
+HKEYS，HCALS，HGETALL底层实现
+
+```c
+//server.h
+#define OBJ_HASH_KEY 1
+#define OBJ_HASH_VALUE 2
+//t_hash.h
+void genericHgetallCommand(client *c, int flags) {
+    robj *o;
+    hashTypeIterator *hi;
+    int multiplier = 0;
+    int length, count = 0;
+	
+    //读操作取，检查类型
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptymultibulk)) == NULL
+        || checkType(c,o,OBJ_HASH)) return;
+	
+    //根据flag判断取键值对中的key还是value还是都取
+    if (flags & OBJ_HASH_KEY) multiplier++;
+    if (flags & OBJ_HASH_VALUE) multiplier++;
+    
+	//取出对象的个数(包括key和value)
+    length = hashTypeLength(o) * multiplier;
+    addReplyMultiBulkLen(c, length);//发送个数给客户端
+
+    hi = hashTypeInitIterator(o);
+    //迭代所有节点根据情况取键值
+    while (hashTypeNext(hi) != C_ERR) {
+        if (flags & OBJ_HASH_KEY) {
+            addHashIteratorCursorToReply(c, hi, OBJ_HASH_KEY);
+            count++;
+            
+        }
+        if (flags & OBJ_HASH_VALUE) {
+            addHashIteratorCursorToReply(c, hi, OBJ_HASH_VALUE);
+            count++;
+        }
+    }
+
+    hashTypeReleaseIterator(hi);
+    serverAssert(count == length);
+}
+```
+
+HSCAN
+
+```c
+void hscanCommand(client *c) {
+    robj *o;
+    unsigned long cursor;
+	//获取scan命令的curser
+    if (parseScanCursorOrReply(c,c->argv[2],&cursor) == C_ERR) return;
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptyscan)) == NULL ||
+        checkType(c,o,OBJ_HASH)) return;
+    //调用server.c中的函数，时所有scan类命令的底层实现
+    //parseScanCursorOrReply也定义在server.c中
+    scanGenericCommand(c,o,cursor);
+}
+```
+
 
 #### 00x06 set
 
 ---
+
+set为不重复无序集合
 
 ##### 数据实现
 
@@ -875,7 +1397,609 @@ robj *createIntsetObject(void) {
 }
 ```
 
+如果集合中的对象都为整数，则encoding默认为OBJ_ENCODING_INTSET，由整数集合实现。
+
+转换为OBJ_ENCODING_HT的条件为(满足其一)
+
+- 整数集合内元素超过redis.conf中的set-max-intset-entries
+- 插入了字符串对象
+
+集合类型定义的基本操作
+
+```c
+//创建set，并带有value这个元素，元素为0的set是不能存在的
+robj *setTypeCreate(robj *value);
+//向subject中添加value，成功返回1，已经存在返回0
+int setTypeAdd(robj *subject, robj *value);
+//删除值为value的元素
+int setTypeRemove(robj *subject, robj *value);
+//检查否存在值为value的元素
+int setTypeIsMember(robj *subject, robj *value);
+//创建并初始化set类型的迭代器
+setTypeIterator *setTypeInitIterator(robj *subject);
+//释放空间
+void setTypeReleaseIterator(setTypeIterator *si);
+//将迭代器当前指向的元素保存在objele或llele中，迭代完毕返回-1
+//返回的对象的引用技术不增加，支持 读时共享写时复制
+int setTypeNext(setTypeIterator *si, robj **objele, int64_t *llele);
+//返回迭代器当前指向的元素的地址，需要手动释放返回的对象
+robj *setTypeNextObject(setTypeIterator *si);
+//随机取出set中一个对象，保存在参数中
+int setTypeRandomElement(robj *setobj, robj **objele, int64_t *llele);
+unsigned long setTypeRandomElements(robj *set, unsigned long count, robj *aux_set);
+//set元素数量
+unsigned long setTypeSize(robj *subject);
+//OBJ_ENCODING_INTSET转换为enc的类型
+//实际上enc只有为OBJ_ENCODING_HT时函数才有效，否则会调用serverPanic()报错，也就是说只能intset转hashtable
+void setTypeConvert(robj *subject, int enc);
+```
+
 ##### 命令实现
+
+SADD，SREM，SMOVE，SISMUMBER，SCARD等单一命令在set基本操作基础上实现并不复杂，这里以SMOVE为例
+
+```c
+//将一个set的元素移动到另一个set
+//移动一个目的set已存在的元素，目的set不变，源set删除此元素
+void smoveCommand(client *c) {
+    robj *srcset, *dstset, *ele;	//根据命令结构结构，argv[0]是命令名，不属于参数
+    srcset = lookupKeyWrite(c->db,c->argv[1]);	//命令中第一个参数为源set的key
+    dstset = lookupKeyWrite(c->db,c->argv[2]);	//第二个参数为目的set的key
+    ele = c->argv[3];					//第三个参数为要移动的元素的value
+
+    /* If the source key does not exist return 0 */
+    if (srcset == NULL) {	//检查源set是否存在
+        addReply(c,shared.czero);
+        return;
+    }
+
+    /* If the source key has the wrong type, or the destination key
+     * is set and has the wrong type, return with an error. */
+    //源set数据类型错误 或 目的set存在且类型错误 时 结束函数
+    if (checkType(c,srcset,OBJ_SET) ||	
+        (dstset && checkType(c,dstset,OBJ_SET))) return;
+
+    /* If srcset and dstset are equal, SMOVE is a no-op */
+    if (srcset == dstset) {	//检查两set是否是同一个
+        addReply(c,setTypeIsMember(srcset,ele->ptr) ?
+            shared.cone : shared.czero);
+        return;
+    }
+
+    /* If the element cannot be removed from the src set, return 0. */
+    if (!setTypeRemove(srcset,ele->ptr)) {	//尝试删除元素
+        addReply(c,shared.czero);
+        return;
+    }
+    notifyKeyspaceEvent(NOTIFY_SET,"srem",c->argv[1],c->db->id);
+	
+    /* Remove the src set from the database when empty */
+    if (setTypeSize(srcset) == 0) {	//删除后set为空时直接从数据库清除
+        dbDelete(c->db,c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
+    }
+
+    /* Create the destination set when it doesn't exist */
+    if (!dstset) {	//如果目的set不存在时则创建新的set，并直接插入元素
+        dstset = setTypeCreate(ele->ptr);
+        dbAdd(c->db,c->argv[2],dstset);
+    }
+
+    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c->db,c->argv[2]);
+    server.dirty++;
+
+    /* An extra key has changed when ele was successfully added to dstset */
+    if (setTypeAdd(dstset,ele->ptr)) {//重复插入并不影响set
+        server.dirty++;
+        notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[2],c->db->id);
+    }
+    addReply(c,shared.cone);
+}
+```
+
+取set随机元素SRANDMEMBER底层实现
+
+```c
+//SRANDMEMBER key [count] 从key对应的set取出随机元素，取出元素数count可选，默认为1个
+//负数表示可出现重复元素
+void srandmemberWithCountCommand(client *c) {
+    long l;
+    unsigned long count, size;
+    int uniq = 1;	//标记返回元素不重复
+    robj *set;
+    sds ele;
+    int64_t llele;
+    int encoding;
+
+    dict *d;
+	//记录要弹出的元素个数
+    if (getLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
+    if (l >= 0) {
+        count = (unsigned long) l;
+    } else { //为负数时转正并取消元素不重复的标志
+        /* A negative count means: return the same elements multiple times
+         * (i.e. don't remove the extracted element after every extraction). */
+        count = -l;
+        uniq = 0;	
+    }
+	
+    //读操作取set
+    if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.emptymultibulk))
+        == NULL || checkType(c,set,OBJ_SET)) return;
+    size = setTypeSize(set);
+	
+    //取0个元素，直接发送empty信息，返回
+    /* If count is zero, serve it ASAP to avoid special cases later. */
+    if (count == 0) {
+        addReply(c,shared.emptymultibulk);
+        return;
+    }
+
+    /* CASE 1: The count was negative, so the extraction method is just:
+     * "return N random elements" sampling the whole set every time.
+     * This case is trivial and can be served without auxiliary data
+     * structures. */
+    //1. 可取重复元素
+    if (!uniq) {
+        addReplyMultiBulkLen(c,count);	//向客户端发送弹出个数信息
+        while(count--) {
+            //从set中随机取出元素，并获取encoding类型
+            encoding = setTypeRandomElement(set,&ele,&llele);
+            //向客户端发送信息
+            if (encoding == OBJ_ENCODING_INTSET) {
+                addReplyBulkLongLong(c,llele);
+            } else {
+                addReplyBulkCBuffer(c,ele,sdslen(ele));
+            }
+        }
+        return;
+    }
+
+    /* CASE 2:
+     * The number of requested elements is greater than the number of
+     * elements inside the set: simply return the whole set. */
+    //2. 前提是元素不重复，并且set中元素不够取
+    //直接返回全部元素
+    if (count >= size) {
+        sunionDiffGenericCommand(c,c->argv+1,1,NULL,SET_OP_UNION);
+        return;
+    }
+
+    /* For CASE 3 and CASE 4 we need an auxiliary dictionary. */
+    //后两种情况需要一个字典
+    d = dictCreate(&objectKeyPointerValueDictType,NULL);
+
+    /* CASE 3:
+     * The number of elements inside the set is not greater than
+     * SRANDMEMBER_SUB_STRATEGY_MUL times the number of requested elements.
+     * In this case we create a set from scratch with all the elements, and
+     * subtract random elements to reach the requested number of elements.
+     *
+     * This is done because if the number of requsted elements is just
+     * a bit less than the number of elements in the set, the natural approach
+     * used into CASE 3 is highly inefficient. */
+    //3. count*3 > size，取元素超过1/3，则先将所有元素加到字典中再作处理
+    //应该是考虑到不重复，在set中不好操作
+    if (count*SRANDMEMBER_SUB_STRATEGY_MUL > size) {
+        setTypeIterator *si;
+
+        /* Add all the elements into the temporary dictionary. */
+        si = setTypeInitIterator(set);
+        //用迭代器遍历set，将元素存到dict里
+        while((encoding = setTypeNext(si,&ele,&llele)) != -1) {
+            int retval = DICT_ERR;
+
+            if (encoding == OBJ_ENCODING_INTSET) {
+                retval = dictAdd(d,createStringObjectFromLongLong(llele),NULL);
+            } else {
+                retval = dictAdd(d,createStringObject(ele,sdslen(ele)),NULL);
+            }
+            serverAssert(retval == DICT_OK);
+        }
+        setTypeReleaseIterator(si);
+        serverAssert(dictSize(d) == size);
+
+        /* Remove random elements to reach the right count. */
+        //随机修剪，直到留下count个元素
+        while(size > count) {
+            dictEntry *de;
+
+            de = dictGetRandomKey(d);
+            dictDelete(d,dictGetKey(de));
+            size--;
+        }
+    }
+
+    /* CASE 4: We have a big set compared to the requested number of elements.
+     * In this case we can simply get random elements from the set and add
+     * to the temporary set, trying to eventually get enough unique elements
+     * to reach the specified count. */
+    //取出元素小于set元素总数的1/3
+    else {
+        unsigned long added = 0;
+        robj *objele;
+		//随机取元素加入dict，直到dict内有count个元素
+        while(added < count) {
+            encoding = setTypeRandomElement(set,&ele,&llele);
+            if (encoding == OBJ_ENCODING_INTSET) {
+                objele = createStringObjectFromLongLong(llele);
+            } else {
+                objele = createStringObject(ele,sdslen(ele));
+            }
+            /* Try to add the object to the dictionary. If it already exists
+             * free it, otherwise increment the number of objects we have
+             * in the result dictionary. */
+            if (dictAdd(d,objele,NULL) == DICT_OK)
+                added++;
+            else
+                //如果已存在此元素，则sds对象引用计数-1，此时为0，空间会被清除
+                decrRefCount(objele);
+        }
+    }
+
+    /* CASE 3 & 4: send the result to the user. */
+    {
+        dictIterator *di;
+        dictEntry *de;
+        //将最终dict的内容返回给客户端
+        addReplyMultiBulkLen(c,count);
+        di = dictGetIterator(d);
+        while((de = dictNext(di)) != NULL)
+            addReplyBulk(c,dictGetKey(de));
+        dictReleaseIterator(di);
+        dictRelease(d);
+    }
+}
+```
+
+交集底层实现
+
+SINTER，SINTERSTORE
+
+```c
+//setkeys源set数组
+void sinterGenericCommand(client *c, robj **setkeys,
+                          unsigned long setnum, robj *dstkey) {
+    robj **sets = zmalloc(sizeof(robj*)*setnum);	//给涉及到的set分配足够空间
+    setTypeIterator *si;
+    robj *dstset = NULL;
+    sds elesds;
+    int64_t intobj;
+    void *replylen = NULL;
+    unsigned long j, cardinality = 0;
+    int encoding;
+
+    //取所有涉及的数组
+    for (j = 0; j < setnum; j++) {
+        //dstkey空时为SINTER，否则为SINTERSTORE命令，取对象方式不同
+        robj *setobj = dstkey ?
+            lookupKeyWrite(c->db,setkeys[j]) :
+            lookupKeyRead(c->db,setkeys[j]);
+        //集合不存在时清理内存并结束命令
+        if (!setobj) {
+            zfree(sets);
+            //对于SINTERSTORE命令，要清理目标set，更新server脏键
+            if (dstkey) {
+                if (dbDelete(c->db,dstkey)) {
+                    signalModifiedKey(c->db,dstkey);
+                    server.dirty++;
+                }
+                addReply(c,shared.czero);
+            } else {	//SINTER因为未做任何修改，只需要向客户端发送empty信息
+                addReply(c,shared.emptymultibulk);
+            }
+            return;
+        }
+        //每一个对象读取成功，先检查数据类型，确认后存入sets数组
+        if (checkType(c,setobj,OBJ_SET)) {
+            zfree(sets);
+            return;
+        }
+        sets[j] = setobj;
+    }
+    /* Sort sets from the smallest to largest, this will improve our
+     * algorithm's performance */
+    //先根据set大小进行快排(小到大)，能提高算法性能
+    qsort(sets,setnum,sizeof(robj*),qsortCompareSetsByCardinality);
+
+    /* The first thing we should output is the total number of elements...
+     * since this is a multi-bulk write, but at this stage we don't know
+     * the intersection set size, so we use a trick, append an empty object
+     * to the output list and save the pointer to later modify it with the
+     * right length */
+    //SINTER，因为返回信息不定长，所以创建临时链表；
+    if (!dstkey) {
+        replylen = addDeferredMultiBulkLength(c);
+    //SINTERSTRORE，创建整数集合
+    } else {
+        /* If we have a target key where to store the resulting set
+         * create this key with an empty set inside */
+        dstset = createIntsetObject();
+    }
+
+    /* Iterate all the elements of the first (smallest) set, and test
+     * the element against all the other sets, if at least one set does
+     * not include the element it is discarded */
+    //对最小的set的所有元素遍历并在后面的set中查找
+    //只要有一个set不存在这个元素，则这个元素不属于交集
+    si = setTypeInitIterator(sets[0]);
+    //用迭代器遍历最小set的每一个元素，根据set的encoding，ht存入elesds，intset存入intobj
+    while((encoding = setTypeNext(si,&elesds,&intobj)) != -1) {
+        for (j = 1; j < setnum; j++) {
+            //相同的set直接跳过
+            if (sets[j] == sets[0]) continue;
+            //如果最小set的encoding为intset
+            if (encoding == OBJ_ENCODING_INTSET) {
+                /* intset with intset is simple... and fast */
+                //要对比的set也是intset，就直接用intset的操作函数(直接传入int64_t)
+                if (sets[j]->encoding == OBJ_ENCODING_INTSET &&
+                    !intsetFind((intset*)sets[j]->ptr,intobj))
+                {
+                    break;
+                /* in order to compare an integer with an object we
+                 * have to use the generic function, creating an object
+                 * for this */
+                //如果要对比的set是hashtable，要把intobj转换为sds对象才能对比
+                } else if (sets[j]->encoding == OBJ_ENCODING_HT) {
+                    elesds = sdsfromlonglong(intobj);
+                    if (!setTypeIsMember(sets[j],elesds)) {
+                        sdsfree(elesds);
+                        break;
+                    }
+                    sdsfree(elesds);
+                }
+            //如果最小set的encoding为ht，则无法转换sds为int64_t，只能直接用IsMember对比
+            } else if (encoding == OBJ_ENCODING_HT) {
+                if (!setTypeIsMember(sets[j],elesds)) {
+                    break;
+                }
+            }
+        }
+
+        /* Only take action when all sets contain the member */
+        //for循环结束后，当前 elesds或intobj中的元素为交集中的元素
+        if (j == setnum) {
+            //这里encoding是最小set的encoding
+            //因为交集的所有元素必然属于这个set，所以直接沿用这个属性
+            if (!dstkey) {//SINTER，直接发送信息到客户端
+                if (encoding == OBJ_ENCODING_HT)
+                    addReplyBulkCBuffer(c,elesds,sdslen(elesds));
+                else
+                    addReplyBulkLongLong(c,intobj);
+                cardinality++;
+            } else {//SINTERSTORE要先保存到set中
+                if (encoding == OBJ_ENCODING_INTSET) {
+                    //int转sds再保存到新set中
+                    elesds = sdsfromlonglong(intobj);
+                    setTypeAdd(dstset,elesds);
+                    sdsfree(elesds);
+                } else {
+                    setTypeAdd(dstset,elesds);
+                }
+            }
+        }
+    }
+    setTypeReleaseIterator(si);
+    
+	//SINTERSTORE命令，交集确定后的存储
+    if (dstkey) {
+        /* Store the resulting set into the target, if the intersection
+         * is not an empty set. */
+        //删除已存在的同名set
+        int deleted = dbDelete(c->db,dstkey);
+        //交集飞空则保存，空集则清理空间
+        if (setTypeSize(dstset) > 0) {
+            dbAdd(c->db,dstkey,dstset);
+            addReplyLongLong(c,setTypeSize(dstset));
+            notifyKeyspaceEvent(NOTIFY_SET,"sinterstore",
+                dstkey,c->db->id);
+        } else {
+            decrRefCount(dstset);
+            addReply(c,shared.czero);	//返回数量为0
+            if (deleted)
+                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
+                    dstkey,c->db->id);
+        }
+        signalModifiedKey(c->db,dstkey);
+        server.dirty++;
+    } else {
+        setDeferredMultiBulkLength(c,replylen,cardinality);
+    }
+    //释放之前占用的临时set数组空间
+    zfree(sets);
+}
+```
+
+并集，差集底层实现
+
+SUNION，SUNIONSTORE，SDIFF，SDIFFSTORE
+
+```c
+#define SET_OP_UNION 0
+#define SET_OP_DIFF 1
+void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
+                              robj *dstkey, int op) {
+    robj **sets = zmalloc(sizeof(robj*)*setnum);
+    setTypeIterator *si;
+    robj *dstset = NULL;
+    sds ele;
+    int j, cardinality = 0;
+    int diff_algo = 1;
+	
+    for (j = 0; j < setnum; j++) {
+        robj *setobj = dstkey ?
+            lookupKeyWrite(c->db,setkeys[j]) :
+            lookupKeyRead(c->db,setkeys[j]);
+        if (!setobj) {
+            //不存在的set设置为NULL
+            sets[j] = NULL;
+            continue;
+        }
+        //但key对应的不是set类型则会开始清理空间并结束命令
+        if (checkType(c,setobj,OBJ_SET)) {
+            zfree(sets);
+            return;
+        }
+        sets[j] = setobj;
+    }
+	//上面的操作与交集类似，分配空间，读取set
+    /* Select what DIFF algorithm to use.
+     *
+     * Algorithm 1 is O(N*M) where N is the size of the element first set
+     * and M the total number of sets.
+     *
+     * Algorithm 2 is O(N) where N is the total number of elements in all
+     * the sets.
+     *
+     * We compute what is the best bet with the current input here. */
+    //下面是差集操作的预处理
+    //对差集实现了两种算法，时间复杂度分别为
+    //1. O(N*M)，N为第一个set的元素个数，M为set个数
+    //2. O(N)，N为总元素个数
+    if (op == SET_OP_DIFF && sets[0]) {
+        long long algo_one_work = 0, algo_two_work = 0;
+
+        for (j = 0; j < setnum; j++) {
+            if (sets[j] == NULL) continue;
+            //分别计算当前情况下两个算法的资源消耗
+            algo_one_work += setTypeSize(sets[0]);
+            algo_two_work += setTypeSize(sets[j]);
+        }
+
+        /* Algorithm 1 has better constant times and performs less operations
+         * if there are elements in common. Give it some advantage. */
+        algo_one_work /= 2;	//相对来说算法1有优势，施加一些倾向性
+        diff_algo = (algo_one_work <= algo_two_work) ? 1 : 2;
+
+        if (diff_algo == 1 && setnum > 1) {
+            /* With algorithm 1 it is better to order the sets to subtract
+             * by decreasing size, so that we are more likely to find
+             * duplicated elements ASAP. */
+            //除sets中第一个意外的其他set，按照(set大小)元素数量排序(降序)
+            qsort(sets+1,setnum-1,sizeof(robj*),qsortCompareSetsByRevCardinality);
+        }
+    }
+
+    /* We need a temp set object to store our union. If the dstkey
+     * is not NULL (that is, we are inside an SUNIONSTORE operation) then
+     * this set object will be the resulting object to set into the target key*/
+    //创建临时set作为结果集
+    dstset = createIntsetObject();
+	
+    //如果是执行并集操作，只要向结果集中加入所有元素即可
+    if (op == SET_OP_UNION) {
+        /* Union is trivial, just add every element of every set to the
+         * temporary set. */
+        for (j = 0; j < setnum; j++) {
+            if (!sets[j]) continue; /* non existing keys are like empty sets */
+
+            si = setTypeInitIterator(sets[j]);
+            while((ele = setTypeNextObject(si)) != NULL) {
+                if (setTypeAdd(dstset,ele)) cardinality++;
+                sdsfree(ele);
+            }
+            setTypeReleaseIterator(si);
+        }
+    //若使用算法1执行差集操作
+    } else if (op == SET_OP_DIFF && sets[0] && diff_algo == 1) {
+        /* DIFF Algorithm 1:
+         *
+         * We perform the diff by iterating all the elements of the first set,
+         * and only adding it to the target set if the element does not exist
+         * into all the other sets.
+         *
+         * This way we perform at max N*M operations, where N is the size of
+         * the first set, and M the number of sets. */
+        si = setTypeInitIterator(sets[0]);
+        //遍历第一个set中的所有元素，将其他set中都不存在的元素加入结果集
+        while((ele = setTypeNextObject(si)) != NULL) {
+            for (j = 1; j < setnum; j++) {
+                //set不存在则直接跳到下一set
+                if (!sets[j]) continue; /* no key is an empty set. */
+                //set相同差集为空
+                if (sets[j] == sets[0]) break; /* same set! */
+                //检查每个set中是否有迭代器当前指向的元素
+                if (setTypeIsMember(sets[j],ele)) break;
+            }
+            //已经通过了所有set的检查，将此元素加入差集
+            if (j == setnum) {
+                /* There is no other set with this element. Add it. */
+                setTypeAdd(dstset,ele);
+                cardinality++;
+            }
+            sdsfree(ele);	//清理临时对象
+        }
+        setTypeReleaseIterator(si);	//清理临时迭代器
+    //使用算法2执行差集操作
+    } else if (op == SET_OP_DIFF && sets[0] && diff_algo == 2) {
+        /* DIFF Algorithm 2:
+         *
+         * Add all the elements of the first set to the auxiliary set.
+         * Then remove all the elements of all the next sets from it.
+         *
+         * This is O(N) where N is the sum of all the elements in every
+         * set. */
+        //只对第一个set的元素向结果集作ADD，其余后方元素作删除操作(无则不变，有则删除)
+        for (j = 0; j < setnum; j++) {
+            //跳过空集合
+            if (!sets[j]) continue; /* non existing keys are like empty sets */
+
+            si = setTypeInitIterator(sets[j]);
+            while((ele = setTypeNextObject(si)) != NULL) {
+                if (j == 0) {
+                    //加入第一个set的元素
+                    if (setTypeAdd(dstset,ele)) cardinality++;
+                } else {
+                    //删除其他元素
+                    if (setTypeRemove(dstset,ele)) cardinality--;
+                }
+                sdsfree(ele);
+            }
+            setTypeReleaseIterator(si);
+
+            /* Exit if result set is empty as any additional removal
+             * of elements will have no effect. */
+            if (cardinality == 0) break;
+        }
+    }
+
+    /* Output the content of the resulting set, if not in STORE mode */
+    //非-STORE命令，只发送消息
+    if (!dstkey) {
+        addReplyMultiBulkLen(c,cardinality);
+        si = setTypeInitIterator(dstset);
+        while((ele = setTypeNextObject(si)) != NULL) {
+            addReplyBulkCBuffer(c,ele,sdslen(ele));
+            sdsfree(ele);
+        }
+        setTypeReleaseIterator(si);
+        decrRefCount(dstset);
+    //需要储存结果的命令
+    } else {
+        /* If we have a target key where to store the resulting set
+         * create this key with the result set inside */
+        //先删后存，同SINTERSTORE
+        int deleted = dbDelete(c->db,dstkey);
+        if (setTypeSize(dstset) > 0) {
+            dbAdd(c->db,dstkey,dstset);
+            addReplyLongLong(c,setTypeSize(dstset));
+            notifyKeyspaceEvent(NOTIFY_SET,
+                op == SET_OP_UNION ? "sunionstore" : "sdiffstore",
+                dstkey,c->db->id);
+        } else {
+            decrRefCount(dstset);
+            addReply(c,shared.czero);
+            if (deleted)
+                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
+                    dstkey,c->db->id);
+        }
+        signalModifiedKey(c->db,dstkey);
+        server.dirty++;
+    }
+    zfree(sets);
+}
+```
 
 #### 00x07 zset
 
