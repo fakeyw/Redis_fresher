@@ -8,7 +8,7 @@
 
 ---
 
-redis本身没有实现内存池，其内存分配方式在预编译时确定<br>选择对象有libc的标准库、jemalloc与google的tcmalloc<br>其中jemalloc依赖在源码的dep中存在，其相对于glibc的malloc的标准库的优势主要体现在避免内存碎片与并发扩展上<br>而tcmalloc则需要主动安装才能使用<br>
+redis本身没有实现内存池，其内存分配方式在预编译时确定<br>选择对象有libc的标准库、jemalloc与google的tcmalloc<br>其中jemalloc依赖在源码的dep中存在，其相对于glibc的malloc标准库的优势主要体现在避免内存碎片与并发扩展上<br>而tcmalloc则需要主动安装才能使用<br>
 
 zmalloc.h中关于内存库的宏：
 
@@ -1175,20 +1175,1185 @@ unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, dict *dic
 
 ---
 
-建议先看数据类型
+> 建议先了解各数据类型与命令实现
+
+redis数据库的结构，定义在server.h中
+
+```c
+typedef struct redisDb {
+    //记录所有的数据结构的键值对 str - robj
+    dict *dict;                 /* The keyspace for this DB */
+    //记录过期时间，由EXPIRE命令设定
+    //string类型也可由SETEX命令在生成的同时设定
+    dict *expires;              /* Timeout of keys with a timeout set */
+    //与阻塞操作相关
+    //dict中的key为造成client阻塞的键，value为所有被该键阻塞的client构成的链表
+    dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP)*/
+    //key为阻塞中的键，value为NULL，与解阻塞的操作相关
+    dict *ready_keys;           /* Blocked keys that received a PUSH */
+    //保存watch命令监视的键
+    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+    int id;                     /* Database ID */
+    //键的平均过期时间
+    long long avg_ttl;          /* Average TTL, just for stats */
+} redisDb;
+
+//server.c 数据库dict结构
+dictType dbDictType = {
+   dictSdsHash,                /* hash function */
+   NULL,                       /* key dup */
+   NULL,                       /* val dup */
+   dictSdsKeyCompare,          /* key compare */
+   dictSdsDestructor,          /* key destructor */
+   dictObjectDestructor   /* val destructor */
+};
+```
+
+redisDb对象保存在client与redisServer对象中
+
+> 这里的client不是实际的客户端，是server接收到连接后对客户端当前状态的建模，也包括虚拟客户端(Lua脚本)
+>
+> 实际的客户端由redis-cli.c实现
+
+```c
+typedef struct client {
+    uint64_t id;            /* Client incremental unique ID. */
+    int fd;                 /* Client socket. */
+    redisDb *db;            /* Pointer to currently SELECTed DB. */
+    /*	...
+    	...
+    	...	 */
+} client;
+
+struct redisServer {
+    /* General */
+    pid_t pid;                  /* Main process pid. */
+    char *configfile;           /* Absolute config file path, or NULL */
+    char *executable;           /* Absolute executable file path. */
+    char **exec_argv;           /* Executable argv vector (copy). */
+    int hz;                     /* serverCron() calls frequency in hertz */
+    redisDb *db;
+    /*	...
+    	...
+    	...	 */
+};
+```
+
+**数据库创建**
+
+服务器启动时，会默认创建一个长度为16的redisDb指针数组
+
+用户登陆后，client当前数据库默认指针指向db[0]
+
+```c
+//server.c
+void initServer(void) {
+   /*	...
+    	...	 */
+    server.db = zmalloc(sizeof(redisDb)*server.dbnum);
+   	/*	...
+    	...	 */
+}
+```
+
+**数据库切换**
+
+对于创建的多个数据库，client可以用SELECT (index)命令切换
+
+```c
+//db.c
+int selectDb(client *c, int id) {
+    //检测id范围
+    if (id < 0 || id >= server.dbnum)
+        return C_ERR;
+    //更新指针
+    c->db = &server.db[id];
+    return C_OK;
+}
+```
+
+**数据操作**
+
+所有数据的键值对都保存在db->dict中，key为对象名称，类型为string，value为保存的数据的结构，类型为string，list，hash，set，zset中的一种。
+
+添加新键值对到数据库/更改某key对应的value对象
+
+```c
+void dbAdd(redisDb *db, robj *key, robj *val) {
+    sds copy = sdsdup(key->ptr);  //从key robj复制出字符串
+    int retval = dictAdd(db->dict, copy, val);  //记录新k-v到dict中
+
+    serverAssertWithInfo(NULL,key,retval == DICT_OK);
+    //与解阻塞有关，会将此list对象的key存入db->ready_keys中
+    if (val->type == OBJ_LIST) signalListAsReady(db, key);
+    if (server.cluster_enabled) slotToKeyAdd(key);  //集群相关
+ }
+
+void dbOverwrite(redisDb *db, robj *key, robj *val) {
+    dictEntry *de = dictFind(db->dict,key->ptr);  //找到原key
+
+    serverAssertWithInfo(NULL,key,de != NULL);
+    //检查内存清理策略
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+        robj *old = dictGetVal(de);
+        int saved_lru = old->lru;  //value的替换不会更新lru
+        dictReplace(db->dict, key->ptr, val);
+        val->lru = saved_lru;
+        /* LFU should be not only copied but also updated
+         * when a key is overwritten. */
+        updateLFU(val);
+    } else {
+        dictReplace(db->dict, key->ptr, val);
+    }
+}
+```
+
+修改数据对象
+
+为保证数据操作的安全性，需要获取数据时会用db.c中定义的`lookupKeyRead()`,`lookupKeyWrite()`，`lookupKeyWriteorReply()`等函数来取出对象
+
+lookupKey()是这些函数的底层实现
+
+```c
+robj *lookupKey(redisDb *db, robj *key, int flags) {
+    dictEntry *de = dictFind(db->dict,key->ptr);
+    if (de) {
+        robj *val = dictGetVal(de);  //取出value
+
+        /* Update the access time for the ageing algorithm.
+         * Don't do it if we have a saving child, as this will trigger
+         * a copy on write madness. */
+        if (server.rdb_child_pid == -1 &&
+            server.aof_child_pid == -1 &&
+            !(flags & LOOKUP_NOTOUCH))
+        {	//更新LRU记录
+            if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+                updateLFU(val);
+            } else {
+                val->lru = LRU_CLOCK();
+            }
+        }
+        return val;
+    } else {
+        return NULL;  //未找到对象时返回NULL
+    }
+}
+```
+
+lookupKeyRead()调用的是lookupKeyReadWithFlags()，后者会将参数中的flag传入lookupKey()
+
+```c
+//server.h
+#define LOOKUP_NONE 0
+#define LOOKUP_NOTOUCH (1<<0)
+
+//这里的flag只有两个值 0 / 1
+//lookupKeyRead()使用LOOKUP_NONE，不进行特殊处理(会正常更新LRU)
+//LOOKUP_NOTOUCH 则表示不更新LRU，有时会取出数据但不是为了读或写，即不进行引用与操作
+//这时，LRU并不需要被更新，就会使用这个flag
+//有expire.c中的ttlGenericCommand() 与db.c中的typeCommand()
+
+//db.c
+robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
+    robj *val;
+	
+    //检查key是否过期(此时查到过期会直接将此对象删除)
+    if (expireIfNeeded(db,key) == 1) {	
+        /* Key expired. If we are in the context of a master, expireIfNeeded()
+         * returns 0 only when the key does not exist at all, so it's safe
+         * to return NULL ASAP. */
+        //如果处于主节点的上下文(环境)，则这个key与其对象已被彻底删除
+        if (server.masterhost == NULL) return NULL;
+
+        /* However if we are in the context of a slave, expireIfNeeded() will
+         * not really try to expire the key, it only returns information
+         * about the "logical" status of the key: key expiring is up to the
+         * master in order to have a consistent view of master's data set.
+         *
+         * However, if the command caller is not the master, and as additional
+         * safety measure, the command invoked is a read-only command, we can
+         * safely return NULL here, and provide a more consistent behavior
+         * to clients accessign expired values in a read-only fashion, that
+         * will say the key as non exisitng.
+         *
+         * Notably this covers GETs when slaves are used to scale reads. */
+        //如果处于从节点上下文(环境)
+        //expireIfNeeded()不会真正地使key失效，只返回这个key是否被删除的逻辑值
+        //为保持数据一致性，key的失效由主节点管理
+        //原文中的accessign大概是作者手滑打错，应该是accessing 访问
+        if (server.current_client &&
+            server.current_client != server.master &&
+            //server.h
+            //struct redisCommand *cmd, *lastcmd;  /* Last command executed. */
+            //最后一条执行的命令记录不可修改，是附加的保持一致性的手段
+            //处于从节点环境且命令记录只读时，可安全地返回NULL
+            server.current_client->cmd &&
+            server.current_client->cmd->flags & CMD_READONLY)
+        {
+            return NULL;
+        }
+    }
+    val = lookupKey(db,key,flags);
+    //记录key命中情况
+    if (val == NULL)
+        server.stat_keyspace_misses++;
+    else
+        server.stat_keyspace_hits++;
+    return val;
+}
+```
+
+只有在读的时候才会记录命中情况，而以写操作取对象的时候不需要记录
+
+**数据过期**
+
+有关过期设置的函数与命令定义在expire.c中
+
+EXPIRE，PEXPIRE，EXPIREAT与PEXPIREAT这四个命令可为key设置过期时间，超时失效
+
+底层实现为expireGenericCommand()
+
+```c
+void expireGenericCommand(client *c, long long basetime, int unit) {
+    robj *key = c->argv[1], *param = c->argv[2];
+    long long when; /* unix time in milliseconds when the key will expire. */
+	
+    //取出param中的时间存入变量when中
+    if (getLongLongFromObjectOrReply(c, param, &when, NULL) != C_OK)
+        return;
+
+    //命令中的设置的时间概念可能是绝对的也可能是相对的
+    //basetime为相对时间的基准值
+    if (unit == UNIT_SECONDS) when *= 1000; //秒转毫秒
+    when += basetime;  //修正时间
+
+    /* No key, return zero. */
+    //检查key是否存在
+    if (lookupKeyWrite(c->db,key) == NULL) {
+        addReply(c,shared.czero);
+        return;
+    }
+
+    /* EXPIRE with negative TTL, or EXPIREAT with a timestamp into the past
+     * should never be executed as a DEL when load the AOF or in the context
+     * of a slave instance.
+     *
+     * Instead we take the other branch of the IF statement setting an expire
+     * (possibly in the past) and wait for an explicit DEL from the master. */
+    //检查过期时间的合法性，不合法会删除
+    //但是删除操作不应该在AOF恢复时进行，也不可在从节点环境中进行
+    if (when <= mstime() && !server.loading && !server.masterhost) {
+        robj *aux;
+		
+        //lazyfree是redis4.0后引入的机制
+        //开启了lazyfree之后，将先从逻辑上删除键值对，实际的数据清理由后台线程操作
+        //这种模式是为了防止某键数据过大引起的长时间阻塞
+        //(所以这不还是要靠并发嘛)
+        int deleted = server.lazyfree_lazy_expire ? dbAsyncDelete(c->db,key) :
+                                                    dbSyncDelete(c->db,key);
+        serverAssertWithInfo(c,key,deleted);
+        server.dirty++;
+
+        /* Replicate/AOF this as an explicit DEL or UNLINK. */
+        aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
+        //将过期命令记录修改为逻辑删除/删除命令
+        rewriteClientCommandVector(c,2,aux,key);
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
+        addReply(c, shared.cone);
+        return;
+    } else {
+        //正常设置超时时间
+        setExpire(c,c->db,key,when);
+        addReply(c,shared.cone);
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
+        server.dirty++;
+        return;
+    }
+}
+```
+
+TTL，PTTL命令底层实现
+
+```c
+void ttlGenericCommand(client *c, int output_ms) {
+    long long expire, ttl = -1;
+
+    /* If the key does not exist at all, return -2 */
+    //命令用于查看key的剩余生存时间，既不读也不写，所以带LOOKUP_NOTOUCH标志
+    if (lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH) == NULL) {
+        addReplyLongLong(c,-2);
+        return;
+    }
+    /* The key exists. Return -1 if it has no expire, or the actual
+     * TTL value otherwise. */
+    expire = getExpire(c->db,c->argv[1]);
+    if (expire != -1) {  //计算剩余时间
+        ttl = expire-mstime();
+        if (ttl < 0) ttl = 0;
+    }
+    if (ttl == -1) {
+        addReplyLongLong(c,-1);
+    } else {
+        //output_ms 0:以秒位单位，1:以毫秒为单位 （+500向上舍入)
+        addReplyLongLong(c,output_ms ? ttl : ((ttl+500)/1000));
+    }
+}
+```
+
+**数据库操作命令实现**
+
+添加键值对的操作只能由PUSH SET等命令执行时调用
+
+但DEL命令(或UNLINK)可独立执行，底层实现
+
+```c
+void delGenericCommand(client *c, int lazy) {
+    int numdel = 0, j;
+	
+    //遍历命令中所有key
+    for (j = 1; j < c->argc; j++) {
+        //过期失效
+        expireIfNeeded(c->db,c->argv[j]);
+        int deleted  = lazy ? dbAsyncDelete(c->db,c->argv[j]) :
+                              dbSyncDelete(c->db,c->argv[j]);
+        //删除成功则发送信号与通知
+        if (deleted) {
+            signalModifiedKey(c->db,c->argv[j]);
+            notifyKeyspaceEvent(NOTIFY_GENERIC,
+                "del",c->argv[j],c->db->id);
+            server.dirty++;	//更新脏键
+            numdel++;	//记录删除key的数量
+        }
+    }
+    //向客户端返回信息
+    addReplyLongLong(c,numdel);
+}
+```
+
+SCAN类命令的底层实现
+
+包括SCAN，HSCAN，SSCAN与ZSCAN
+
+```c
+void scanGenericCommand(client *c, robj *o, unsigned long cursor) {
+    int i, j;
+    list *keys = listCreate();
+    listNode *node, *nextnode;
+    long count = 10;
+    sds pat = NULL;
+    int patlen = 0, use_pattern = 0;
+    dict *ht;
+	
+    //传入的o必须是hash，set或zset
+    //分别用于SSCAN，HSCAN与ZSCAN
+    /* Object must be NULL (to iterate keys names), or the type of the object
+     * must be Set, Sorted Set, or Hash. */
+    serverAssert(o == NULL || o->type == OBJ_SET || o->type == OBJ_HASH ||
+                o->type == OBJ_ZSET);
+    
+    /* Set i to the first option argument. The previous one is the cursor. */
+    //o不为NULL时，第一个参数为目标对象的key
+    //为NULL时迭代的是数据库中的键值对，没有key参数，其他参数下标从2开始
+    i = (o == NULL) ? 2 : 3; /* Skip the key argument if needed. */
+
+    /* Step 1: Parse options. */
+    while (i < c->argc) {
+        j = c->argc - i;
+        //设置每次迭代返回的元素个数count
+        //但迭代对象编码为intset或ziplist时，此选项无效
+        if (!strcasecmp(c->argv[i]->ptr, "count") && j >= 2) {
+            if (getLongFromObjectOrReply(c, c->argv[i+1], &count, NULL)
+                != C_OK)
+                
+            {
+                goto cleanup;
+            }
+
+            if (count < 1) {
+                addReply(c,shared.syntaxerr);
+                goto cleanup;
+            }
+
+            i += 2;
+        //匹配选项，内容为通配符
+        } else if (!strcasecmp(c->argv[i]->ptr, "match") && j >= 2) {
+            pat = c->argv[i+1]->ptr;
+            patlen = sdslen(pat);
+
+            /* The pattern always matches if it is exactly "*", so it is
+             * equivalent to disabling it. */
+            //只有一个*，即匹配所有，与不进行匹配等效
+            use_pattern = !(pat[0] == '*' && patlen == 1);
+
+            i += 2;
+        } else {
+            addReply(c,shared.syntaxerr);
+            goto cleanup;
+        }
+    }
+
+    /* Step 2: Iterate the collection.
+     *
+     * Note that if the object is encoded with a ziplist, intset, or any other
+     * representation that is not a hash table, we are sure that it is also
+     * composed of a small number of elements. So to avoid taking state we
+     * just return everything inside the object in a single call, setting the
+     * cursor to zero to signal the end of the iteration. */
+	//编码为intset或ziplist的对象元素较少
+    //执行命令时将无视count命令将所有元素(包括k，v)全部发挥给客户端
+    
+    /* Handle the case of a hash table. */
+    //处理元素较多的，带有hashtable结构的数据类型
+    ht = NULL;
+    if (o == NULL) {
+        ht = c->db->dict;
+    } else if (o->type == OBJ_SET && o->encoding == OBJ_ENCODING_HT) {
+        ht = o->ptr;
+    } else if (o->type == OBJ_HASH && o->encoding == OBJ_ENCODING_HT) {
+        ht = o->ptr;
+        count *= 2; /* We return key / value for this type. */
+    } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_SKIPLIST) {
+        zset *zs = o->ptr;
+        ht = zs->dict;
+        count *= 2; /* We return key / value for this type. */
+    }
+	
+    //所有带有hashtable的数据类型
+    if (ht) {
+        void *privdata[2];
+        /* We set the max number of iterations to ten times the specified
+         * COUNT, so if the hash table is in a pathological state (very
+         * sparsely populated) we avoid to block too much time at the cost
+         * of returning no or very few elements. */
+        //设置迭代上限为count*10
+        //在hashtable出现问题的状况下，以此避免的长时间阻塞后只能返回极少元素
+        long maxiterations = count*10;
+
+        /* We pass two pointers to the callback: the list to which it will
+         * add new elements, and the object containing the dictionary so that
+         * it is possible to fetch more data in a type-dependent way. */
+        privdata[0] = keys;
+        privdata[1] = o;
+        do {
+            //从cursor位置开始，逐个用scanCallback将ht中的key提取到列表keys中
+            //privdata中的o仅用于判断对象数据类型
+            cursor = dictScan(ht, cursor, scanCallback, NULL, privdata);
+        } while (cursor &&
+              maxiterations-- &&
+              listLength(keys) < (unsigned long)count);
+   	//encoding为intset的set对象
+    } else if (o->type == OBJ_SET) {
+        int pos = 0;
+        int64_t ll;
+
+        while(intsetGet(o->ptr,pos++,&ll))	//从intset中取对象放入ll
+            listAddNodeTail(keys,createStringObjectFromLongLong(ll));
+        cursor = 0;	//迭代结束(无视count)
+    //encoding为ziplist的hash对象与zset对象
+    } else if (o->type == OBJ_HASH || o->type == OBJ_ZSET) {
+        unsigned char *p = ziplistIndex(o->ptr,0);
+        unsigned char *vstr;
+        unsigned int vlen;
+        long long vll;
+
+        while(p) {
+            ziplistGet(p,&vstr,&vlen,&vll);
+            listAddNodeTail(keys,
+                (vstr != NULL) ? createStringObject((char*)vstr,vlen) :
+                                 createStringObjectFromLongLong(vll));
+            p = ziplistNext(o->ptr,p);
+        }
+        cursor = 0;  //迭代结束
+    } else {  //无法应用SCAN类命令的对象
+        serverPanic("Not handled encoding in SCAN.");
+    }
+
+    /* Step 3: Filter elements. */
+    node = listFirst(keys);  //listFirst是一个宏函数，返回list的头节点指针
+    while (node) {
+        robj *kobj = listNodeValue(node);  //取key
+        nextnode = listNextNode(node);     //指向下个节点的指针
+        int filter = 0;
+
+        /* Filter element if it does not match the pattern. */
+        //(为什么不在取的过程中过滤呢?)
+        if (!filter && use_pattern) {
+           //如果key是个字符串
+            if (sdsEncodedObject(kobj)) {
+                //与pattern不匹配时设置过滤标记
+                if (!stringmatchlen(pat, patlen, kobj->ptr, sdslen(kobj->ptr), 0))
+                    filter = 1;
+            //key是整数
+            } else { 
+                char buf[LONG_STR_SIZE];
+                int len;
+                
+                serverAssert(kobj->encoding == OBJ_ENCODING_INT);
+                //先将整数转换为字符串，再匹配
+                len = ll2string(buf,sizeof(buf),(long)kobj->ptr);
+                if (!stringmatchlen(pat, patlen, buf, len, 0)) filter = 1;
+            }
+        }
+
+        /* Filter element if it is an expired key. */
+        //迭代对象为数据库时，如果key过期则会过滤掉
+        if (!filter && o == NULL && expireIfNeeded(c->db, kobj)) filter = 1;
+
+        /* Remove the element and its associted value if needed. */
+        //如果确认这个key需要被过滤，则将其从keys中删除
+        if (filter) {
+            decrRefCount(kobj);
+            listDelNode(keys, node);
+        }
+
+        /* If this is a hash or a sorted set, we have a flat list of
+         * key-value elements, so if this element was filtered, remove the
+         * value, or skip it if it was not filtered: we only match keys. */
+        //迭代对象为ziplist编码的hash和zset对象
+        if (o && (o->type == OBJ_ZSET || o->type == OBJ_HASH)) {
+            node = nextnode;
+            nextnode = listNextNode(node);
+            if (filter) {
+                kobj = listNodeValue(node);
+                decrRefCount(kobj);
+                listDelNode(keys, node);
+            }
+        }
+        node = nextnode;
+    }
+
+    /* Step 4: Reply to the client. */
+    //发送信号，消息，向客户端返回信息
+    addReplyMultiBulkLen(c, 2);
+    addReplyBulkLongLong(c,cursor);
+
+    addReplyMultiBulkLen(c, listLength(keys));
+    while ((node = listFirst(keys)) != NULL) {
+        robj *kobj = listNodeValue(node);
+        addReplyBulk(c, kobj);
+        decrRefCount(kobj);
+        listDelNode(keys, node);
+    }
+
+cleanup:
+    listSetFreeMethod(keys,decrRefCountVoid);
+    listRelease(keys);
+}
+```
+
+RENAME，RENAMEX底层实现
+
+```c
+void renameGenericCommand(client *c, int nx) {
+    robj *o;
+    long long expire;
+    int samekey = 0;
+
+    /* When source and dest key is the same, no operation is performed,
+     * if the key exists, however we still return an error on unexisting key. */
+    //新旧键名相同，更改samekey标志
+    if (sdscmp(c->argv[1]->ptr,c->argv[2]->ptr) == 0) samekey = 1;
+	
+    //以写操作取对象
+    if ((o = lookupKeyWriteOrReply(c,c->argv[1],shared.nokeyerr)) == NULL)
+        return;
+
+    if (samekey) {
+        addReply(c,nx ? shared.czero : shared.ok);
+        return;
+    }
+	
+    //先增加待操作value对象的引用计数，防止删除key条目导致value对象被清除
+    incrRefCount(o);  
+    //备份旧key的过期时间，之后将作为新key的过期时间使用
+    expire = getExpire(c->db,c->argv[1]);
+    //检查新key是否存在，与nx标志(不存在)是否冲突
+    if (lookupKeyWrite(c->db,c->argv[2]) != NULL) {
+        if (nx) { //冲突则结束命令
+            decrRefCount(o);
+            addReply(c,shared.czero);
+            return;
+        }
+        /* Overwrite: delete the old key before creating the new one
+         * with the same name. */
+        dbDelete(c->db,c->argv[2]);  //无nx则删除之前存在的新key条目
+    }
+    dbAdd(c->db,c->argv[2],o);  //以新key存入value对象
+    if (expire != -1) setExpire(c,c->db,c->argv[2],expire);  //设置过期时间
+    dbDelete(c->db,c->argv[1]);  //删除旧key
+    //发送两个键被修改的信号
+    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c->db,c->argv[2]);
+    notifyKeyspaceEvent(NOTIFY_GENERIC,"rename_from",
+        c->argv[1],c->db->id);
+    notifyKeyspaceEvent(NOTIFY_GENERIC,"rename_to",
+        c->argv[2],c->db->id);
+    server.dirty++;  //更新脏键
+    addReply(c,nx ? shared.cone : shared.ok);
+}
+```
 
 ##### 00x05 RDB持久化
 
 ---
 
+RDB模式的持久化是将当前数据生成快照存入硬盘
 
+**优点**
+
+.rdb文件为经过较强压缩的二进制文件，适合转移与复制
+
+因为恢复时只需要读出键值对存入工作内存，所以速度比AOF模式高很多
+
+**缺点**
+
+不同redis版本中.rdb文件的编排方式可能不一致，不过问题不大
+
+每次执行持久化，目标范围都是全部数据，即使调用fork()放在后台操作也将占用大量资源，时间也较长。所以不可能实现高频的持久化，更不可能做到实时备份。
+
+**触发**
+
+有主动和被动两种触发方式
+
+- 主动
+
+  SAVE，BGSAVE命令，其中BGSAVE为并发后台处理
+
+- 被动
+
+  在配置文件中默认有 `save 900 1` `save 300 10` `save 60 1000 ` 等条目，`save M N` 代表计时M秒内对数据库进行了N次修改将触发RDB持久化
+
+  也可用CONFIG SET命令更改配置
+
+**存储方式**
+
+中间结构
+
+```c
+typedef struct rdbSaveInfo {
+    /* Used saving and loading. */
+    int repl_stream_db;  /* DB to select in server.master client. */
+
+    /* Used only loading. */
+    int repl_id_is_set;  /* True if repl_id field is set. */
+    char repl_id[CONFIG_RUN_ID_SIZE+1];     /* Replication ID. */
+    long long repl_offset;                  /* Replication offset. */
+} rdbSaveInfo;
+```
+
+将rdb文件写入rio中
+
+> rdb文件结构
+>
+> | "REDIS" | 版本    | 默认辅助信息 | 数据 | EOF    | 校验和  |
+> | ------- | ------- | ------------ | ---- | ------ | ------- |
+> | 5 bytes | 4 bytes | 不定         | 不定 | 1 byte | 8 bytes |
+
+```c
+int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) {
+    dictIterator *di = NULL;
+    dictEntry *de;
+    char magic[10];
+    int j;
+    long long now = mstime();
+    uint64_t cksum;
+    size_t processed = 0;
+	
+    //开启校验和
+    if (server.rdb_checksum)
+        //设置校验和使用的函数
+        rdb->update_cksum = rioGenericUpdateChecksum;
+    //向magic中写入redis版本信息
+    snprintf(magic,sizeof(magic),"REDIS%04d",RDB_VERSION);
+    //将magic写入rio
+    if (rdbWriteRaw(rdb,magic,9) == -1) goto werr;
+    //将rdb文件辅助信息写入rio
+    if (rdbSaveInfoAuxFields(rdb,flags,rsi) == -1) goto werr;
+
+    //遍历所有数据库
+    for (j = 0; j < server.dbnum; j++) {
+        redisDb *db = server.db+j;
+        dict *d = db->dict;
+        //跳过空数据库
+        if (dictSize(d) == 0) continue;
+        di = dictGetSafeIterator(d);
+        if (!di) return C_ERR;
+
+        /* Write the SELECT DB opcode */
+        //写入选择数据库操作码
+        if (rdbSaveType(rdb,RDB_OPCODE_SELECTDB) == -1) goto werr;
+        //写入数据库id
+        if (rdbSaveLen(rdb,j) == -1) goto werr;
+
+        /* Write the RESIZE DB opcode. We trim the size to UINT32_MAX, which
+         * is currently the largest type we are able to represent in RDB sizes.
+         * However this does not limit the actual size of the DB to load since
+         * these sizes are just hints to resize the hash tables. */
+        uint32_t db_size, expires_size;
+        //字典大小大于UINT32_MAX，则db_size设置为最大值UINT32_MAX
+        //但这不是实际数据库大小，而是作为重新调整hashtable的标志
+        db_size = (dictSize(db->dict) <= UINT32_MAX) ?
+                                dictSize(db->dict) :
+                                UINT32_MAX;
+        //过期时间大小作类似处理
+        expires_size = (dictSize(db->expires) <= UINT32_MAX) ?
+                                dictSize(db->expires) :
+                                UINT32_MAX;
+        //写入resize的操作码
+        if (rdbSaveType(rdb,RDB_OPCODE_RESIZEDB) == -1) goto werr;
+        //写入前面确定的两个值
+        if (rdbSaveLen(rdb,db_size) == -1) goto werr;
+        if (rdbSaveLen(rdb,expires_size) == -1) goto werr;
+
+        /* Iterate this DB writing every entry */
+        //遍历当前数据库的键值对
+        while((de = dictNext(di)) != NULL) {
+            sds keystr = dictGetKey(de);
+            robj key, *o = dictGetVal(de);
+            long long expire;
+
+            //宏函数，关联key与sds类型的keystr作为key对象
+            initStaticStringObject(key,keystr);
+            //获取key的过期时间
+            expire = getExpire(db,&key);
+            //写入键值对与过期时间
+            if (rdbSaveKeyValuePair(rdb,&key,o,expire,now) == -1) goto werr;
+
+            /* When this RDB is produced as part of an AOF rewrite, move
+             * accumulated diff from parent to child while rewriting in
+             * order to have a smaller final write. */
+            //当这个RDB持久化操作是在AOF恢复的过程中执行的时侯，
+            //子进程会从父进程中读取积累的差异变化到一个缓冲区中
+            //在恢复的最后会一并进行处理
+            //(不知道是否正确)
+            if (flags & RDB_SAVE_AOF_PREAMBLE &&
+                rdb->processed_bytes > processed+AOF_READ_DIFF_INTERVAL_BYTES)
+            {
+                processed = rdb->processed_bytes;
+                aofReadDiffFromParent();
+            }
+        }
+        dictReleaseIterator(di);
+    }
+    di = NULL; /* So that we don't release it again on error. */
+
+    /* If we are storing the replication information on disk, persist
+     * the script cache as well: on successful PSYNC after a restart, we need
+     * to be able to process any EVALSHA inside the replication backlog the
+     * master will send us. */
+    //保存脚本
+    if (rsi && dictSize(server.lua_scripts)) {
+        di = dictGetIterator(server.lua_scripts);
+        while((de = dictNext(di)) != NULL) {
+            robj *body = dictGetVal(de);
+            if (rdbSaveAuxField(rdb,"lua",3,body->ptr,sdslen(body->ptr)) == -1)
+                goto werr;
+        }
+        dictReleaseIterator(di);
+    }
+
+    /* EOF opcode */
+    //写入结束符 255
+    if (rdbSaveType(rdb,RDB_OPCODE_EOF) == -1) goto werr;
+
+    /* CRC64 checksum. It will be zero if checksum computation is disabled, the
+     * loading code skips the check in this case. */
+    //计算，写入校验和
+    cksum = rdb->cksum;
+    memrev64ifbe(&cksum);
+    if (rioWrite(rdb,&cksum,8) == 0) goto werr;
+    return C_OK;
+
+werr:
+    //保存错误码
+    if (error) *error = errno;
+    if (di) dictReleaseIterator(di);
+    return C_ERR;
+}
+```
+
+默认辅助信息
+
+```c
+int rdbSaveInfoAuxFields(rio *rdb, int flags, rdbSaveInfo *rsi) {
+    //判断主机总线宽度
+    int redis_bits = (sizeof(void*) == 8) ? 64 : 32;
+    int aof_preamble = (flags & RDB_SAVE_AOF_PREAMBLE) != 0;
+
+    /* Add a few fields about the state when the RDB was created. */
+    //写入状态信息，版本，位数，当前时间，已使用内存
+    if (rdbSaveAuxFieldStrStr(rdb,"redis-ver",REDIS_VERSION) == -1) return -1;
+    if (rdbSaveAuxFieldStrInt(rdb,"redis-bits",redis_bits) == -1) return -1;
+    if (rdbSaveAuxFieldStrInt(rdb,"ctime",time(NULL)) == -1) return -1;
+    if (rdbSaveAuxFieldStrInt(rdb,"used-mem",zmalloc_used_memory()) == -1) return -1;
+
+    /* Handle saving options that generate aux fields. */
+    //处理生成辅助域的选项
+    if (rsi) {
+        if (rdbSaveAuxFieldStrInt(rdb,"repl-stream-db",rsi->repl_stream_db)
+            == -1) return -1;
+        if (rdbSaveAuxFieldStrStr(rdb,"repl-id",server.replid)
+            == -1) return -1;
+        if (rdbSaveAuxFieldStrInt(rdb,"repl-offset",server.master_repl_offset)
+            == -1) return -1;
+    }
+    if (rdbSaveAuxFieldStrInt(rdb,"aof-preamble",aof_preamble) == -1) return -1;
+    return 1;
+}
+```
+
+**执行**
+
+持久化底层实现
+
+```c
+int rdbSave(char *filename, rdbSaveInfo *rsi) {
+    char tmpfile[256];
+    char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
+    FILE *fp;
+    rio rdb;
+    int error = 0;
+	
+    //将文件名写入tmpfile中
+    snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
+    fp = fopen(tmpfile,"w");
+    //文件无法打开
+    if (!fp) {
+        //获取当前路径，报错，写入日志
+        char *cwdp = getcwd(cwd,MAXPATHLEN);
+        serverLog(LL_WARNING,
+            "Failed opening the RDB file %s (in server root dir %s) "
+            "for saving: %s",
+            filename,
+            cwdp ? cwdp : "unknown",
+            strerror(errno));
+        return C_ERR;
+    }
+
+    //将二进制数据写入文件
+    rioInitWithFile(&rdb,fp);
+    if (rdbSaveRio(&rdb,&error,RDB_SAVE_NONE,rsi) == C_ERR) {
+        errno = error;
+        //报存失败进入错误处理流程
+        goto werr;
+    }
+
+    /* Make sure data will not remain on the OS's output buffers */
+    //清空缓冲区，释放资源
+    if (fflush(fp) == EOF) goto werr;
+    if (fsync(fileno(fp)) == -1) goto werr;
+    if (fclose(fp) == EOF) goto werr;
+
+    /* Use RENAME to make sure the DB file is changed atomically only
+     * if the generate DB file is ok. */
+    //重命名
+    if (rename(tmpfile,filename) == -1) {
+        //失败则放弃持久化并清除文件
+        char *cwdp = getcwd(cwd,MAXPATHLEN);
+        serverLog(LL_WARNING,
+            "Error moving temp DB file %s on the final "
+            "destination %s (in server root dir %s): %s",
+            tmpfile,
+            filename,
+            cwdp ? cwdp : "unknown",
+            strerror(errno));
+        unlink(tmpfile);
+        return C_ERR;
+    }
+	
+    //更新日志
+    serverLog(LL_NOTICE,"DB saved on disk");
+    server.dirty = 0;  //脏键归零
+    server.lastsave = time(NULL);  //更新最近保存时间
+    server.lastbgsave_status = C_OK;
+    return C_OK;
+
+werr:
+    serverLog(LL_WARNING,"Write error saving DB on disk: %s", strerror(errno));
+    fclose(fp);  //释放文件资源
+    unlink(tmpfile);  //删除文件
+    return C_ERR;
+}
+```
+
+后台执行实现
+
+```c
+int rdbSaveBackground(char *filename, rdbSaveInfo *rsi) {
+    pid_t childpid;
+    long long start;
+	
+    //确保当前没有进行其他持久化操作
+    if (server.aof_child_pid != -1 || server.rdb_child_pid != -1) return C_ERR;
+
+    //备份脏键值，最后一次尝试持久化的时间
+    server.dirty_before_bgsave = server.dirty;
+    server.lastbgsave_try = time(NULL);
+    //打开server中子进程与父进程间的管道
+    openChildInfoPipe();
+
+    //记录开始时间
+    start = ustime();
+    //调用fork函数
+    if ((childpid = fork()) == 0) {
+        int retval;
+
+        /* Child */
+        //以下为子进程执行的代码
+        closeListeningSockets(0);  //关闭所有监听的socket
+        redisSetProcTitle("redis-rdb-bgsave");  //设置进程标题
+        retval = rdbSave(filename,rsi);  //调用rdbsave函数保存
+        if (retval == C_OK) {
+            //(Linux)获取/proc/$pid/smaps中Private_dirty的值
+            //这个值表示(子进程)有修改的私有页大小
+            size_t private_dirty = zmalloc_get_private_dirty(-1);
+
+            if (private_dirty) {
+                serverLog(LL_NOTICE,
+                    "RDB: %zu MB of memory used by copy-on-write",
+                    private_dirty/(1024*1024));
+            }
+            
+            //保存并向父进程发送copy-on-write size
+            server.child_info_data.cow_size = private_dirty;
+            sendChildInfo(CHILD_INFO_TYPE_RDB);
+        }
+        //子进程结束，向父进程发送信号，成功为0，失败为1
+        exitFromChild((retval == C_OK) ? 0 : 1);
+    } else {
+        /* Parent */
+        //以下代码与子进程代码并发执行
+        //fork时间(仅包括创建子进程，不包括代码rdb持久化执行)
+        server.stat_fork_time = ustime()-start;
+        //fork速率，单位为GB/s
+        server.stat_fork_rate = (double) zmalloc_used_memory() * 1000000 / server.stat_fork_time / (1024*1024*1024); /* GB per second. */
+        //在fork执行时间超过配置中设置的阈值的情况下，将事件存入一个dict，延迟诊断
+        latencyAddSampleIfNeeded("fork",server.stat_fork_time/1000);
+        //fork失败
+        if (childpid == -1) {
+            //关闭通信管道
+            closeChildInfoPipe();
+            server.lastbgsave_status = C_ERR;
+            serverLog(LL_WARNING,"Can't save in background: fork: %s",
+                strerror(errno));
+            return C_ERR;
+        }
+        //更新日志
+        serverLog(LL_NOTICE,"Background saving started by pid %d",childpid);
+        server.rdb_save_time_start = time(NULL); //设置rdb开始时间
+        server.rdb_child_pid = childpid; //执行rdb的子进程id
+        server.rdb_child_type = RDB_CHILD_TYPE_DISK; //BGSAVE类型
+        //更新hastableh的resize功能
+        //此时rdb_child_pid不为-1，动作为关闭resize
+        //只有rdb_child_pid与aof_child_pid都为-1时动作才为开启resize
+        //hashtable的resize过程中会出现大量内存页的复制
+        updateDictResizePolicy();
+        return C_OK;
+    }
+    return C_OK; /* unreached */
+}
+```
+
+BGSAVE命令实现
+
+```c
+void bgsaveCommand(client *c) {
+    int schedule = 0;
+
+    /* The SCHEDULE option changes the behavior of BGSAVE when an AOF rewrite
+     * is in progress. Instead of returning an error a BGSAVE gets scheduled. */
+    if (c->argc > 1) {
+        //设置schedule标志
+        if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"schedule")) {
+            schedule = 1;
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
+    
+    rdbSaveInfo rsi, *rsiptr;
+    //根据情况更改rsi->repl_stream_db
+    rsiptr = rdbPopulateSaveInfo(&rsi);
+	
+    //如果后台有执行中的RDB持久化，直接退出
+    if (server.rdb_child_pid != -1) {
+        addReplyError(c,"Background save already in progress");
+    //后台有执行中的AOF持久化
+    } else if (server.aof_child_pid != -1) {
+        //如果设置了schedule，则将BGSAVE的执行放入预定计划中
+        if (schedule) {
+            server.rdb_bgsave_scheduled = 1;
+            addReplyStatus(c,"Background saving scheduled");
+        //没有设置则不能继续执行
+        } else {
+            addReplyError(c,
+                "An AOF log rewriting in progress: can't BGSAVE right now. "
+                "Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever "
+                "possible.");
+        }
+    //尝试后台执行
+    } else if (rdbSaveBackground(server.rdb_filename,rsiptr) == C_OK) {
+        addReplyStatus(c,"Background saving started");
+    //执行失败
+    } else {
+        addReply(c,shared.err);
+    }
+}
+
+```
 
 ##### 00x06 AOF持久化
 
 ---
 
+AOF模式会记录所有执行过的命令，恢复时按照顺序执行aof文件中的命令
+
+记录命令时，不直接写入aof文件中，这样会受制于磁盘读写速度
+
+而是先将命令写入缓冲区，之后再将内容同步到磁盘文件中
+
+缓冲区在redisServer结构中，是一个sds
+
+**追加记录**
+
+实现追加命令到缓冲区
+
+```c
+sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv) {
+    char buf[32];
+    int len, j;
+    robj *o;
+
+    buf[0] = '*';
+    len = 1+ll2string(buf+1,sizeof(buf)-1,argc);
+    buf[len++] = '\r';
+    buf[len++] = '\n';
+    dst = sdscatlen(dst,buf,len);
+
+    for (j = 0; j < argc; j++) {
+        o = getDecodedObject(argv[j]);
+        buf[0] = '$';
+        len = 1+ll2string(buf+1,sizeof(buf)-1,sdslen(o->ptr));
+        buf[len++] = '\r';
+        buf[len++] = '\n';
+        dst = sdscatlen(dst,buf,len);
+        dst = sdscatlen(dst,o->ptr,sdslen(o->ptr));
+        dst = sdscatlen(dst,"\r\n",2);
+        decrRefCount(o);
+    }
+    return dst;
+}
+```
+
+实现追加过期时间到缓冲区
+
+需要将相对时间转换为绝对时间
+
+```c
+sds catAppendOnlyExpireAtCommand(sds buf, struct redisCommand *cmd, robj *key, robj *seconds) {
+    long long when;
+    robj *argv[3];
+
+    /* Make sure we can use strtoll */
+    seconds = getDecodedObject(seconds);
+    when = strtoll(seconds->ptr,NULL,10);
+    /* Convert argument into milliseconds for EXPIRE, SETEX, EXPIREAT */
+    if (cmd->proc == expireCommand || cmd->proc == setexCommand ||
+        cmd->proc == expireatCommand)
+    {
+        when *= 1000;
+    }
+    /* Convert into absolute time for EXPIRE, PEXPIRE, SETEX, PSETEX */
+    if (cmd->proc == expireCommand || cmd->proc == pexpireCommand ||
+        cmd->proc == setexCommand || cmd->proc == psetexCommand)
+    {
+        when += mstime();
+    }
+    decrRefCount(seconds);
+
+    argv[0] = createStringObject("PEXPIREAT",9);
+    argv[1] = key;
+    argv[2] = createStringObjectFromLongLong(when);
+    buf = catAppendOnlyGenericCommand(buf, 3, argv);
+    decrRefCount(argv[0]);
+    decrRefCount(argv[2]);
+    return buf;
+}
+```
+
+追加操作，调用以上两个函数
+
+```c
+void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc) {
+    sds buf = sdsempty();
+    robj *tmpargv[3];
+
+    /* The DB this command was targeting is not the same as the last command
+     * we appended. To issue a SELECT command is needed. */
+    if (dictid != server.aof_selected_db) {
+        char seldb[64];
+
+        snprintf(seldb,sizeof(seldb),"%d",dictid);
+        buf = sdscatprintf(buf,"*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n",
+            (unsigned long)strlen(seldb),seldb);
+        server.aof_selected_db = dictid;
+    }
+
+    if (cmd->proc == expireCommand || cmd->proc == pexpireCommand ||
+        cmd->proc == expireatCommand) {
+        /* Translate EXPIRE/PEXPIRE/EXPIREAT into PEXPIREAT */
+        buf = catAppendOnlyExpireAtCommand(buf,cmd,argv[1],argv[2]);
+    } else if (cmd->proc == setexCommand || cmd->proc == psetexCommand) {
+        /* Translate SETEX/PSETEX to SET and PEXPIREAT */
+        tmpargv[0] = createStringObject("SET",3);
+        tmpargv[1] = argv[1];
+        tmpargv[2] = argv[3];
+        buf = catAppendOnlyGenericCommand(buf,3,tmpargv);
+        decrRefCount(tmpargv[0]);
+        buf = catAppendOnlyExpireAtCommand(buf,cmd,argv[1],argv[2]);
+    } else if (cmd->proc == setCommand && argc > 3) {
+        int i;
+        robj *exarg = NULL, *pxarg = NULL;
+        /* Translate SET [EX seconds][PX milliseconds] to SET and PEXPIREAT */
+        buf = catAppendOnlyGenericCommand(buf,3,argv);
+        for (i = 3; i < argc; i ++) {
+            if (!strcasecmp(argv[i]->ptr, "ex")) exarg = argv[i+1];
+            if (!strcasecmp(argv[i]->ptr, "px")) pxarg = argv[i+1];
+        }
+        serverAssert(!(exarg && pxarg));
+        if (exarg)
+            buf = catAppendOnlyExpireAtCommand(buf,server.expireCommand,argv[1],
+                                               exarg);
+        if (pxarg)
+            buf = catAppendOnlyExpireAtCommand(buf,server.pexpireCommand,argv[1],
+                                               pxarg);
+    } else {
+        /* All the other commands don't need translation or need the
+         * same translation already operated in the command vector
+         * for the replication itself. */
+        buf = catAppendOnlyGenericCommand(buf,argc,argv);
+    }
+
+    /* Append to the AOF buffer. This will be flushed on disk just before
+     * of re-entering the event loop, so before the client will get a
+     * positive reply about the operation performed. */
+    if (server.aof_state == AOF_ON)
+        server.aof_buf = sdscatlen(server.aof_buf,buf,sdslen(buf));
+
+    /* If a background append only file rewriting is in progress we want to
+     * accumulate the differences between the child DB and the current one
+     * in a buffer, so that when the child process will do its work we
+     * can append the differences to the new append only file. */
+    if (server.aof_child_pid != -1)
+        aofRewriteBufferAppend((unsigned char*)buf,sdslen(buf));
+
+    sdsfree(buf);
+}
+```
 
 
-1. redis.h redisDb结构、db.c *
-2. RDB rdb.c *
-3. AOF aof.c *
+
