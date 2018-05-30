@@ -36,41 +36,66 @@ if (server.cluster_enabled) clusterInit();
 #define CLUSTER_SLOTS 16384
 
 typedef struct clusterState {
+    //代表本节点
     clusterNode *myself;  /* This node */
+    //当前纪元
     uint64_t currentEpoch;
+    //状态
     int state;            /* CLUSTER_OK, CLUSTER_FAIL, ... */
+    //至少负责一个slot的主节点个数
     int size;             /* Num of master nodes with at least one slot */
+    //保存集群节点
     dict *nodes;          /* Hash table of name -> clusterNode structures */
+    //保证一些节点在一些时间内不可读
     dict *nodes_black_list; /* Nodes we don't re-add for a few seconds. */
+    //记录导入slots
     clusterNode *migrating_slots_to[CLUSTER_SLOTS];
+    //记录导出slots
     clusterNode *importing_slots_from[CLUSTER_SLOTS];
+    //slot映射到节点
     clusterNode *slots[CLUSTER_SLOTS];
+    //slot包括的key的数量
     uint64_t slots_keys_count[CLUSTER_SLOTS];
+    //slot映射到keys
     rax *slots_to_keys;
     /* The following fields are used to take the slave state on elections. */
+    //前一次或下次选举时间
     mstime_t failover_auth_time; /* Time of previous or next election. */
+    //当前已获得支持数
     int failover_auth_count;    /* Number of votes received so far. */
+    //是否已投票
     int failover_auth_sent;     /* True if we already asked for votes. */
+    //当前从节点的排名
     int failover_auth_rank;     /* This slave rank for current auth request. */
+    //当前选举纪元
     uint64_t failover_auth_epoch; /* Epoch of the current election. */
+    //不能进行故障转移的原因
     int cant_failover_reason;   /* Why a slave is currently not able to
                                    failover. See the CANT_FAILOVER_* macros. */
     /* Manual failover state in common. */
+    //手动故障转移状态
     mstime_t mf_end;            /* Manual failover time limit (ms unixtime).
                                    It is zero if there is no MF in progress. */
     /* Manual failover state of master. */
+    //执行故障转移的从节点
     clusterNode *mf_slave;      /* Slave performing the manual failover. */
     /* Manual failover state of slave. */
+    //从节点开始故障转移时主节点偏移量
     long long mf_master_offset; /* Master offset the slave needs to start MF
                                    or zero if stil not received. */
+    //故障转移是否能开始
     int mf_can_start;           /* If non-zero signal that the manual failover
                                    can start requesting masters vote. */
     /* The followign fields are used by masters to take state on elections. */
+    //集群最后一次投票的纪元
     uint64_t lastVoteEpoch;     /* Epoch of the last vote granted. */
+    //clusterBeforeSleep()执行的内容
     int todo_before_sleep; /* Things to do in clusterBeforeSleep(). */
     /* Messages received and sent by type. */
+    //总线发送/接收的字节数
     long long stats_bus_messages_sent[CLUSTERMSG_TYPE_COUNT];
     long long stats_bus_messages_received[CLUSTERMSG_TYPE_COUNT];
+    //处在PFAIL状态的节点
     long long stats_pfail_nodes;    /* Number of nodes in PFAIL status,
                                        excluding nodes without address. */
 } clusterState;
@@ -83,6 +108,7 @@ typedef struct clusterState {
 void clusterInit(void) {
     int saveconf = 0;
 
+    //初始化各种状态
     server.cluster = zmalloc(sizeof(clusterState));
     server.cluster->myself = NULL;
     server.cluster->currentEpoch = 0;
@@ -108,10 +134,12 @@ void clusterInit(void) {
 
     /* Lock the cluster config file to make sure every node uses
      * its own nodes.conf. */
+    //确保配置文件不被重复使用
     if (clusterLockConfig(server.cluster_configfile) == C_ERR)
         exit(1);
 
     /* Load or create a new nodes configuration. */
+    //读取配置文件，如果没有则创建一个配置文件
     if (clusterLoadConfig(server.cluster_configfile) == C_ERR) {
         /* No configuration found. We will just use the random name provided
          * by the createClusterNode() function. */
@@ -130,6 +158,8 @@ void clusterInit(void) {
     /* Port sanity check II
      * The other handshake port check is triggered too late to stop
      * us from trying to use a too-high cluster port number. */
+    //集群总线端口默认为当前服务端口+10000
+    //服务端口应设置为小于55535的值
     if (server.port > (65535-CLUSTER_PORT_INCR)) {
         serverLog(LL_WARNING, "Redis port number too high. "
                    "Cluster communication port is 10,000 port "
@@ -145,7 +175,8 @@ void clusterInit(void) {
         exit(1);
     } else {
         int j;
-
+	
+        //为监听的每个端口设置可读事件处理函数
         for (j = 0; j < server.cfd_count; j++) {
             if (aeCreateFileEvent(server.el, server.cfd[j], AE_READABLE,
                 clusterAcceptHandler, NULL) == AE_ERR)
@@ -155,12 +186,14 @@ void clusterInit(void) {
     }
 
     /* The slots -> keys map is a radix tree. Initialize it here. */
+    //slots -> keys 是一个基数树(广泛用于查找与内存管理)
     server.cluster->slots_to_keys = raxNew();
     memset(server.cluster->slots_keys_count,0,
            sizeof(server.cluster->slots_keys_count));
 
     /* Set myself->port / cport to my listening ports, we'll just need to
      * discover the IP address via MEET messages. */
+    //保存监听的两个端口
     myself->port = server.port;
     myself->cport = server.port+CLUSTER_PORT_INCR;
     if (server.cluster_announce_port)
@@ -213,40 +246,49 @@ int verifyClusterConfigWithData(void) {
 
     /* If this node is a slave, don't perform the check at all as we
      * completely depend on the replication stream. */
+    //当前节点为从节点，不检查
     if (nodeIsSlave(myself)) return C_OK;
 
     /* Make sure we only have keys in DB0. */
+    //只有0号数据库有数据
     for (j = 1; j < server.dbnum; j++) {
         if (dictSize(server.db[j].dict)) return C_ERR;
     }
 
     /* Check that all the slots we see populated memory have a corresponding
      * entry in the cluster table. Otherwise fix the table. */
+    //确认是否所有slot都被覆盖
     for (j = 0; j < CLUSTER_SLOTS; j++) {
+        //当前slot没有包含key，跳过
         if (!countKeysInSlot(j)) continue; /* No keys in this slot. */
         /* Check if we are assigned to this slot or if we are importing it.
          * In both cases check the next slot as the configuration makes
          * sense. */
+        //跳过当前节点的slot
+        //跳过要导入的slot
         if (server.cluster->slots[j] == myself ||
             server.cluster->importing_slots_from[j] != NULL) continue;
 
         /* If we are here data and cluster config don't agree, and we have
          * slot 'j' populated even if we are not importing it, nor we are
          * assigned to this slot. Fix this condition. */
-
+        //需要更新配置的标志
         update_config++;
         /* Case A: slot is unassigned. Take responsibility for it. */
+        //如果这个slot没被覆盖，则直接由当前节点负责
         if (server.cluster->slots[j] == NULL) {
             serverLog(LL_WARNING, "I have keys for unassigned slot %d. "
                                     "Taking responsibility for it.",j);
             clusterAddSlot(myself,j);
         } else {
+            //若已被覆盖，则记录在importing_slots_from中
             serverLog(LL_WARNING, "I have keys for slot %d, but the slot is "
                                     "assigned to another node. "
                                     "Setting it to importing state.",j);
             server.cluster->importing_slots_from[j] = server.cluster->slots[j];
         }
     }
+    //更新配置
     if (update_config) clusterSaveConfigOrDie(1);
     return C_OK;
 }
@@ -333,6 +375,7 @@ typedef struct clusterLink {
     int fd;                     /* TCP socket file descriptor */
     sds sndbuf;                 /* Packet send buffer */
     sds rcvbuf;                 /* Packet reception buffer */
+    //与此连接关联的节点
     struct clusterNode *node;   /* Node related to this link if any, or NULL */
 } clusterLink;
 
@@ -347,11 +390,10 @@ int clusterAddNode(clusterNode *node) {
 ```
 
 两个节点握手的基本流程：
-
-       	1. A向B发送MEET消息
-       	2. B接收并处理MEET消息，向A返回PONG消息
-       	3. A接收并处理PONG消息，向B回复PING消息
-       	4. 之后每隔1s就会发送一个PING消息进行故障检测
+1. A向B发送MEET消息
+2. B接收并处理MEET消息，向A返回PONG消息
+3. A接收并处理PONG消息，向B回复PING消息
+4. 之后每隔1s就会发送一个PING消息进行故障检测
 
 **准备发送MEET消息**
 
@@ -414,6 +456,7 @@ int clusterStartHandshake(char *ip, int port, int cport) {
     struct sockaddr_storage sa;
 
     /* IP sanity check */
+    //ip可用性测试
     if (inet_pton(AF_INET,ip,
             &(((struct sockaddr_in *)&sa)->sin_addr)))
     {
@@ -428,6 +471,7 @@ int clusterStartHandshake(char *ip, int port, int cport) {
     }
 
     /* Port sanity check */
+    //端口可用性测试
     if (port <= 0 || port > 65535 || cport <= 0 || cport > 65535) {
         errno = EINVAL;
         return 0;
@@ -435,6 +479,7 @@ int clusterStartHandshake(char *ip, int port, int cport) {
 
     /* Set norm_ip as the normalized string representation of the node
      * IP address. */
+    //设置节点地址的标准字符串
     memset(norm_ip,0,NET_IP_STR_LEN);
     if (sa.ss_family == AF_INET)
         inet_ntop(AF_INET,
@@ -444,7 +489,8 @@ int clusterStartHandshake(char *ip, int port, int cport) {
         inet_ntop(AF_INET6,
             (void*)&(((struct sockaddr_in6 *)&sa)->sin6_addr),
             norm_ip,NET_IP_STR_LEN);
-
+	
+    //检查这个地址是否正在进行握手
     if (clusterHandshakeInProgress(norm_ip,port,cport)) {
         errno = EAGAIN;
         return 0;
@@ -453,6 +499,7 @@ int clusterStartHandshake(char *ip, int port, int cport) {
     /* Add the node with a random address (NULL as first argument to
      * createClusterNode()). Everything will be fixed during the
      * handshake. */
+    //创建一个名字随机的节点
     n = createClusterNode(NULL,CLUSTER_NODE_HANDSHAKE|CLUSTER_NODE_MEET);
     memcpy(n->ip,norm_ip,sizeof(n->ip));
     n->port = port;
@@ -474,12 +521,14 @@ void clusterCron(void) {
      * not turned into a normal node is removed from the nodes. Usually it is
      * just the NODE_TIMEOUT value, but when NODE_TIMEOUT is too small we use
      * the value of 1 second. */
+    //握手被要求在设置的超时时间内完成，最小为1s
     handshake_timeout = server.cluster_node_timeout;
     if (handshake_timeout < 1000) handshake_timeout = 1000;
 
     /* Check if we have disconnected nodes and re-establish the connection.
      * Also update a few stats while we are here, that can be used to make
      * better decisions in other part of the code. */
+    //检查是否有断开或进行过重连的节点
     di = dictGetSafeIterator(server.cluster->nodes);
     server.cluster->stats_pfail_nodes = 0;
     while((de = dictNext(di)) != NULL) {
@@ -487,25 +536,32 @@ void clusterCron(void) {
 
         /* Not interested in reconnecting the link with myself or nodes
          * for which we have no address. */
+        //跳过本节点与地址未知的节点
         if (node->flags & (CLUSTER_NODE_MYSELF|CLUSTER_NODE_NOADDR)) continue;
-
+		
+        //检查是否为 可能失效状态
         if (node->flags & CLUSTER_NODE_PFAIL)
             server.cluster->stats_pfail_nodes++;
 
         /* A Node in HANDSHAKE state has a limited lifespan equal to the
          * configured node timeout. */
+        //检查握手是否超时
         if (nodeInHandshake(node) && now - node->ctime > handshake_timeout) {
+            //超时会被删除，跳过
             clusterDelNode(node);
             continue;
         }
-
+		
+        //如果与这个节点连接为空
         if (node->link == NULL) {
             int fd;
             mstime_t old_ping_sent;
             clusterLink *link;
-
+			
+            //尝试连接这个节点
             fd = anetTcpNonBlockBindConnect(server.neterr, node->ip,
                 node->cport, NET_FIRST_BIND_ADDR);
+            //连接失败，跳过
             if (fd == -1) {
                 /* We got a synchronous error from connect before
                  * clusterSendPing() had a chance to be called.
@@ -518,9 +574,11 @@ void clusterCron(void) {
                     node->cport, server.neterr);
                 continue;
             }
+            //连接成功，创建连接信息结构
             link = createClusterLink(node);
             link->fd = fd;
             node->link = link;
+            //设置可读事件的处理函数
             aeCreateFileEvent(server.el,link->fd,AE_READABLE,
                     clusterReadHandler,link);
             /* Queue a PING in the new connection ASAP: this is crucial
@@ -529,9 +587,12 @@ void clusterCron(void) {
              * If the node is flagged as MEET, we send a MEET message instead
              * of a PING one, to force the receiver to add us in its node
              * table. */
+            //保存原PING命令发送的事件
             old_ping_sent = node->ping_sent;
+            //发送一个MEET/PING命令
             clusterSendPing(link, node->flags & CLUSTER_NODE_MEET ?
                     CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
+            //如果之前发送过PING命令，则要还原
             if (old_ping_sent) {
                 /* If there was an active ping before the link was
                  * disconnected, we want to restore the ping time, otherwise
@@ -543,6 +604,7 @@ void clusterCron(void) {
              * to this node. Instead after the PONG is received and we
              * are no longer in meet/handshake status, we want to send
              * normal PING packets. */
+            //清除MEET标识
             node->flags &= ~CLUSTER_NODE_MEET;
 
             serverLog(LL_DEBUG,"Connecting with Node %.40s at %s:%d",
@@ -558,6 +620,8 @@ void clusterCron(void) {
 
 1. 在clusterCron中，A在发送MEET消息前先用aeCreateFileEvent()将clusterReadHandler()加入事件循环监听与B建立的连接，等待可能返回的PONG消息
 
+   clusterReadHandler()用于处理消息头部并读出完整信息
+
 ```c
 /* Read data. Try to read the first field of the header first to check the
  * full length of the packet. When a whole packet is in memory this function
@@ -570,12 +634,16 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     unsigned int readlen, rcvbuflen;
     UNUSED(el);
     UNUSED(mask);
-
+	
+    //从socket中读取数据
     while(1) { /* Read as long as there is data to read. */
+        //获取对当前连接的接收缓冲区大小
         rcvbuflen = sdslen(link->rcvbuf);
+        //长度小于8，无法从一次读出的信息中获取消息总长
         if (rcvbuflen < 8) {
             /* First, obtain the first 8 bytes to get the full message
              * length. */
+            //需要再读的信息长度
             readlen = 8 - rcvbuflen;
         } else {
             /* Finally read the full message. */
@@ -583,6 +651,7 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             if (rcvbuflen == 8) {
                 /* Perform some sanity check on the message signature
                  * and length. */
+                //前四字节要为RCmb，否则释放该连接
                 if (memcmp(hdr->sig,"RCmb",4) != 0 ||
                     ntohl(hdr->totlen) < CLUSTERMSG_MIN_LEN)
                 {
@@ -593,13 +662,16 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                     return;
                 }
             }
+            //已读入的内容长度
             readlen = ntohl(hdr->totlen) - rcvbuflen;
             if (readlen > sizeof(buf)) readlen = sizeof(buf);
         }
 
+        //从socket中读数据
         nread = read(fd,buf,readlen);
+        //空读
         if (nread == -1 && errno == EAGAIN) return; /* No more data ready. */
-
+        //读取出错
         if (nread <= 0) {
             /* I/O error... */
             serverLog(LL_DEBUG,"I/O error reading from node link: %s",
@@ -607,6 +679,7 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             handleLinkIOError(link);
             return;
         } else {
+            //读取成功，追加到接收缓冲区中
             /* Read data and recast the pointer to the new buffer. */
             link->rcvbuf = sdscatlen(link->rcvbuf,buf,nread);
             hdr = (clusterMsg*) link->rcvbuf;
@@ -614,6 +687,7 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
 
         /* Total length obtained? Process this packet. */
+        //检查数据完整性
         if (rcvbuflen >= 8 && rcvbuflen == ntohl(hdr->totlen)) {
             if (clusterProcessPacket(link)) {
                 sdsfree(link->rcvbuf);
@@ -626,7 +700,7 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 }
 ```
 
-2. A与B建立连接时会触发B的clusterAcceptHandler()函数，类似socket的accept()，同样对可读socket(fd 文件描述符)设置clusterReadHandler()
+2. A与B建立连接时会触发B的clusterAcceptHandler()函数，类似socket的accept()，创建了link信息并对可读socket(fd 文件描述符)设置clusterReadHandler()
 
    收到一条消息后，clusterReadHandler()将socket的数据读到clusterLink的rcvbuf(接收缓冲区)并判断消息是否读取完整
 
@@ -638,30 +712,41 @@ void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 int clusterProcessPacket(clusterLink *link) {
     //......
     /* Check if the sender is a known node. */
+    //从集群中查找sender节点
     sender = clusterLookupNode(hdr->sender);
+    //如果存在并且其未处于握手状态
     if (sender && !nodeInHandshake(sender)) {
         /* Update our curretEpoch if we see a newer epoch in the cluster. */
+        //更新集群纪元
         senderCurrentEpoch = ntohu64(hdr->currentEpoch);
         senderConfigEpoch = ntohu64(hdr->configEpoch);
+        //更新集群当前纪元
         if (senderCurrentEpoch > server.cluster->currentEpoch)
             server.cluster->currentEpoch = senderCurrentEpoch;
         /* Update the sender configEpoch if it is publishing a newer one. */
+        //更新sender信息中的配置纪元
         if (senderConfigEpoch > sender->configEpoch) {
             sender->configEpoch = senderConfigEpoch;
+            //设置要更新配置和状态的标志
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                                  CLUSTER_TODO_FSYNC_CONFIG);
         }
         /* Update the replication offset info for this node. */
+        //更新复制偏移量与更新复制偏移量的时间
         sender->repl_offset = ntohu64(hdr->offset);
         sender->repl_offset_time = mstime();
         /* If we are a slave performing a manual failover and our master
          * sent its offset while already paused, populate the MF state. */
+        //如果当前节点时正在进行手动故障转移的从节点
+        //sender节点为当前节点的主节点
+        //并且主节点发送复制偏移量时，已经暂停手动故障转移的动作
         if (server.cluster->mf_end &&
             nodeIsSlave(myself) &&
             myself->slaveof == sender &&
             hdr->mflags[0] & CLUSTERMSG_FLAG0_PAUSED &&
             server.cluster->mf_master_offset == 0)
         {
+            //设置从节点已复制的偏移量
             server.cluster->mf_master_offset = sender->repl_offset;
             serverLog(LL_WARNING,
                 "Received replication offset for paused "
@@ -671,6 +756,7 @@ int clusterProcessPacket(clusterLink *link) {
     }
     
     /* Initial processing of PING and MEET requests replying with a PONG. */
+    //处理MEET与PING，并用PONG回复
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
         serverLog(LL_DEBUG,"Ping packet received: %p", (void*)link->node);
 
@@ -685,11 +771,13 @@ int clusterProcessPacket(clusterLink *link) {
          * However if we don't have an address at all, we update the address
          * even with a normal PING packet. If it's wrong it will be fixed
          * by MEET later. */
+        
+        //如果是MEET消息，或者是其他消息但当前集群节点的ip记录为空
         if ((type == CLUSTERMSG_TYPE_MEET || myself->ip[0] == '\0') &&
             server.cluster_announce_ip == NULL)
         {
             char ip[NET_IP_STR_LEN];
-
+            //根据socket获取自己的ip，并更新myself信息
             if (anetSockName(link->fd,ip,sizeof(ip),NULL) != -1 &&
                 strcmp(ip,myself->ip))
             {
@@ -704,13 +792,15 @@ int clusterProcessPacket(clusterLink *link) {
          * In this stage we don't try to add the node with the right
          * flags, slaveof pointer, and so forth, as this details will be
          * resolved when we'll receive PONGs from the node. */
+        //如果没有sender，即这个消息来自未知的节点，且消息类型未MEET
         if (!sender && type == CLUSTERMSG_TYPE_MEET) {
             clusterNode *node;
-
+            //创建一个处于握手状态的节点
             node = createClusterNode(NULL,CLUSTER_NODE_HANDSHAKE);
             nodeIp2String(node->ip,link,hdr->myip);
             node->port = ntohs(hdr->port);
             node->cport = ntohs(hdr->cport);
+            //添加到集群中
             clusterAddNode(node);
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
         }
@@ -718,10 +808,12 @@ int clusterProcessPacket(clusterLink *link) {
         /* If this is a MEET packet from an unknown node, we still process
          * the gossip section here since we have to trust the sender because
          * of the message type. */
+        //未知节点MEET，处理gossip协议信息
         if (!sender && type == CLUSTERMSG_TYPE_MEET)
             clusterProcessGossipSection(hdr,link);
 
         /* Anyway reply with a PONG */
+        //回复一个PONG
         clusterSendPing(link,CLUSTERMSG_TYPE_PONG);
     }
 ```
@@ -731,20 +823,25 @@ int clusterProcessPacket(clusterLink *link) {
 ```c
 //接上一块代码
 	/* PING, PONG, MEET: process config information. */
+	//处理配置信息
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
         type == CLUSTERMSG_TYPE_MEET)
     {
         serverLog(LL_DEBUG,"%s packet received: %p",
             type == CLUSTERMSG_TYPE_PING ? "ping" : "pong",
             (void*)link->node);
+        //该连接的节点存在
         if (link->node) {
+            //并且该节点处于握手状态
             if (nodeInHandshake(link->node)) {
                 /* If we already have this node, try to change the
                  * IP/port of the node with the new one. */
+                //sender节点在集群信息中存在
                 if (sender) {
                     serverLog(LL_VERBOSE,
                         "Handshake: we already know node %.40s, "
                         "updating the address if needed.", sender->name);
+                    //在必要的情况下更新地址
                     if (nodeUpdateAddressIfNeeded(sender,link,hdr))
                     {
                         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
@@ -752,18 +849,22 @@ int clusterProcessPacket(clusterLink *link) {
                     }
                     /* Free this node as we already have it. This will
                      * cause the link to be freed as well. */
+                    //释放连接信息中的节点
                     clusterDelNode(link->node);
                     return 0;
                 }
 
                 /* First thing to do is replacing the random name with the
                  * right node name if this was a handshake stage. */
+                //将连接关联的节点重命名为sender的名字
                 clusterRenameNode(link->node, hdr->sender);
                 serverLog(LL_DEBUG,"Handshake with node %.40s completed.",
                     link->node->name);
+                //取消握手状态，设置节点是主节点还是从节点
                 link->node->flags &= ~CLUSTER_NODE_HANDSHAKE;
                 link->node->flags |= flags&(CLUSTER_NODE_MASTER|CLUSTER_NODE_SLAVE);
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+            //两节点不相同
             } else if (memcmp(link->node->name,hdr->sender,
                         CLUSTER_NAMELEN) != 0)
             {
@@ -774,10 +875,13 @@ int clusterProcessPacket(clusterLink *link) {
                     link->node->name,
                     (int)(mstime()-(link->node->ctime)),
                     link->node->flags);
+                //设置NOADDR标志
                 link->node->flags |= CLUSTER_NODE_NOADDR;
+                //清除关联节点地址信息
                 link->node->ip[0] = '\0';
                 link->node->port = 0;
                 link->node->cport = 0;
+                //释放连接
                 freeClusterLink(link);
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
                 return 0;
@@ -785,6 +889,7 @@ int clusterProcessPacket(clusterLink *link) {
         }
 
         /* Update the node address if it changed. */
+        //对于PING消息，可尝试更新连接地址
         if (sender && type == CLUSTERMSG_TYPE_PING &&
             !nodeInHandshake(sender) &&
             nodeUpdateAddressIfNeeded(sender,link,hdr))
@@ -794,8 +899,11 @@ int clusterProcessPacket(clusterLink *link) {
         }
         
         /* Update our info about the node */
+        //link关联节点存在，并发来PONG消息
         if (link->node && type == CLUSTERMSG_TYPE_PONG) {
+            //更新最近一次接收到PONG消息的时间
             link->node->pong_received = mstime();
+            //清空最近一次发送PING消息的时间
             link->node->ping_sent = 0;
 
             /* The PFAIL condition can be reversed without external
@@ -804,11 +912,14 @@ int clusterProcessPacket(clusterLink *link) {
              *
              * The FAIL condition is also reversible under specific
              * conditions detected by clearNodeFailureIfNeeded(). */
+            //可取消PFAIL标识
             if (nodeTimedOut(link->node)) {
                 link->node->flags &= ~CLUSTER_NODE_PFAIL;
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                                      CLUSTER_TODO_UPDATE_STATE);
+            //如果这个节点已经下线了
             } else if (nodeFailed(link->node)) {
+                //尝试取消下线标识
                 clearNodeFailureIfNeeded(link->node);
             }
         }
@@ -1071,25 +1182,30 @@ void clusterCommand(client *c) {
         /* CLUSTER DELSLOTS <slot> [slot] ... */
         int j, slot;
         unsigned char *slots = zmalloc(CLUSTER_SLOTS);
+    	//DELSLOTS命令
         int del = !strcasecmp(c->argv[1]->ptr,"delslots");
 
         memset(slots,0,CLUSTER_SLOTS);
         /* Check that all the arguments are parseable and that all the
          * slots are not already busy. */
+    	//遍历参数中指定的slot，排除三种不能处理的情况
         for (j = 2; j < c->argc; j++) {
             if ((slot = getSlotOrReply(c,c->argv[j])) == -1) {
                 zfree(slots);
                 return;
             }
+            //要删除，但slot无所属节点
             if (del && server.cluster->slots[slot] == NULL) {
                 addReplyErrorFormat(c,"Slot %d is already unassigned", slot);
                 zfree(slots);
                 return;
+            //要添加，但slot已有所属节点
             } else if (!del && server.cluster->slots[slot]) {
                 addReplyErrorFormat(c,"Slot %d is already busy", slot);
                 zfree(slots);
                 return;
             }
+            //slot在参数中出现多次
             if (slots[slot]++ == 1) {
                 addReplyErrorFormat(c,"Slot %d specified multiple times",
                     (int)slot);
@@ -1097,21 +1213,24 @@ void clusterCommand(client *c) {
                 return;
             }
         }
+    	//再次遍历，进行槽位操作
         for (j = 0; j < CLUSTER_SLOTS; j++) {
             if (slots[j]) {
                 int retval;
 
                 /* If this slot was set as importing we can clear this
                  * state as now we are the real owner of the slot. */
+                //清除导入状态，让这个slot归属于当前节点
                 if (server.cluster->importing_slots_from[j])
                     server.cluster->importing_slots_from[j] = NULL;
-
+                //执行操作
                 retval = del ? clusterDelSlot(j) :
                                clusterAddSlot(myself,j);
                 serverAssertWithInfo(c,NULL,retval == C_OK);
             }
         }
         zfree(slots);
+    	//保存状态与配置
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
         addReply(c,shared.ok);
 	} //......
@@ -1120,17 +1239,23 @@ void clusterCommand(client *c) {
 
 //跟进add操作
 int clusterAddSlot(clusterNode *n, int slot) {
+    //与刚才的检查重复了
     if (server.cluster->slots[slot]) return C_ERR;
+    //设置slot的归属
     clusterNodeSetSlotBit(n,slot);
+    //设置负责该slot的节点
     server.cluster->slots[slot] = n;
     return C_OK;
 }
 
 //分配槽位底层实现
 int clusterNodeSetSlotBit(clusterNode *n, int slot) {
+    //好像又重复了，检查slot是否已被设置
     int old = bitmapTestBit(n->slots,slot);
+    //slot设置为1，下方有详细注释
     bitmapSetBit(n->slots,slot);
     if (!old) {
+        //更新节点负责的slot的数目
         n->numslots++;
         /* When a master gets its first slot, even if it has no slaves,
          * it gets flagged with MIGRATE_TO, that is, the master is a valid
@@ -1145,6 +1270,7 @@ int clusterNodeSetSlotBit(clusterNode *n, int slot) {
          * migration tagets if the rest of the cluster is not a slave-less.
          *
          * See https://github.com/antirez/redis/issues/3043 for more info. */
+        //如果是第一次被分配slot，且没有从节点，则设置可迁移标志
         if (n->numslots == 1 && clusterMastersHaveSlaves())
             n->flags |= CLUSTER_NODE_MIGRATE_TO;
     }
@@ -1177,28 +1303,36 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
      * If this node is a slave we send the master's information instead (the
      * node is flagged as slave so the receiver knows that it is NOT really
      * in charge for this slots. */
+    //当前节点为主节点，发送slot bitmap与配置纪元
+    //当前节点为从节点，发送其所属主节点的slot bitmap与配置纪元
     master = (nodeIsSlave(myself) && myself->slaveof) ?
               myself->slaveof : myself;
 
     memset(hdr,0,sizeof(*hdr));
+    //消息在头部加入签名，没有签名会被断开连接
     hdr->ver = htons(CLUSTER_PROTO_VER);
     hdr->sig[0] = 'R';
     hdr->sig[1] = 'C';
     hdr->sig[2] = 'm';
     hdr->sig[3] = 'b';
+    //设置消息类型
     hdr->type = htons(type);
+    //加入当前节点的名称
     memcpy(hdr->sender,myself->name,CLUSTER_NAMELEN);
 
     /* If cluster-announce-ip option is enabled, force the receivers of our
      * packets to use the specified address for this node. Otherwise if the
      * first byte is zero, they'll do auto discovery. */
+    //清空ip信息
     memset(hdr->myip,0,NET_IP_STR_LEN);
+    //将设置在集群节点间使用的本节点ip地址写入hdr->myip
     if (server.cluster_announce_ip) {
         strncpy(hdr->myip,server.cluster_announce_ip,NET_IP_STR_LEN);
         hdr->myip[NET_IP_STR_LEN-1] = '\0';
     }
 
     /* Handle cluster-announce-port as well. */
+    //确定服务与集群总线端口
     int announced_port = server.cluster_announce_port ?
                          server.cluster_announce_port : server.port;
     int announced_cport = server.cluster_announce_bus_port ?
@@ -1207,19 +1341,24 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
 	
     //向消息头中加入slot信息
     memcpy(hdr->myslots,master->slots,sizeof(hdr->myslots));
+    //如果当前节点为从节点，设置主节点名称
     memset(hdr->slaveof,0,CLUSTER_NAMELEN);
     if (myself->slaveof != NULL)
         memcpy(hdr->slaveof,myself->slaveof->name, CLUSTER_NAMELEN);
+    //设置端口，节点类型，集群状态
     hdr->port = htons(announced_port);
     hdr->cport = htons(announced_cport);
     hdr->flags = htons(myself->flags);
     hdr->state = server.cluster->state;
 
     /* Set the currentEpoch and configEpochs. */
+    //设置当前纪元与配置纪元
     hdr->currentEpoch = htonu64(server.cluster->currentEpoch);
     hdr->configEpoch = htonu64(master->configEpoch);
 
     /* Set the replication offset. */
+    //如果当前节点为从节点，设置复制偏移量
+    //为主节点，设置主节点的复制偏移量
     if (nodeIsSlave(myself))
         offset = replicationGetSlaveOffset();
     else
@@ -1227,11 +1366,13 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     hdr->offset = htonu64(offset);
 
     /* Set the message flags. */
+    //设置信息标志
     if (nodeIsMaster(myself) && server.cluster->mf_end)
         hdr->mflags[0] |= CLUSTERMSG_FLAG0_PAUSED;
 
     /* Compute the message length for certain messages. For other messages
      * this is up to the caller. */
+    //如果为FAIL/UPDATE消息，计算消息总长度
     if (type == CLUSTERMSG_TYPE_FAIL) {
         totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
         totlen += sizeof(clusterMsgDataFail);
@@ -1239,6 +1380,7 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
         totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
         totlen += sizeof(clusterMsgDataUpdate);
     }
+    //设置总长
     hdr->totlen = htonl(totlen);
     /* For PING, PONG, and MEET, fixing the totlen field is up to the caller. */
 }
@@ -1247,8 +1389,6 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
 **记录更新**
 
 clusterProcessPacket() 中确认消息来自一主节点，并且有slot信息需要更新，则会调用clusterUpdateSlotsConfigWith() 函数对当前节点的记录进行更新
-
-
 
 ```c
 int clusterProcessPacket(clusterLink *link) {
@@ -1266,12 +1406,20 @@ int clusterProcessPacket(clusterLink *link) {
          * instance claims is different compared to the set of slots we have
          * for it. Check this ASAP to avoid other computational expansive
          * checks later. */
+        //更新当前节点负责slot的信息
+        //与握手第三步，主动节点处理PONG消息的代码处于同一if块内
+        //两者中间隔的部分是检测主从切换与更新信息的代码
+        //而且下面的操作不行在更新主从状态后进行，因为需要CLUSTER_NODE_MASTER标志
         clusterNode *sender_master = NULL; /* Sender or its master if slave. */
         int dirty_slots = 0; /* Sender claimed slots don't match my view? */
 
         if (sender) {
+            //如果sender是主节点，直接获取其信息
+            //如果是从节点，则获取其所属主节点的信息
             sender_master = nodeIsMaster(sender) ? sender : sender->slaveof;
             if (sender_master) {
+                //对比从对方那里获取的信息与当前节点视角下保存的集群slot信息
+                //dirty_slots不为0表示有差异
                 dirty_slots = memcmp(sender_master->slots,
                         hdr->myslots,sizeof(hdr->myslots)) != 0;
             }
@@ -1280,7 +1428,9 @@ int clusterProcessPacket(clusterLink *link) {
         /* 1) If the sender of the message is a master, and we detected that
          *    the set of slots it claims changed, scan the slots to see if we
          *    need to update our configuration. */
+        //1.sender是一个主节点，但slot信息不匹配
         if (sender && nodeIsMaster(sender) && dirty_slots)
+            //更新当前节点视角下sender的信息
             clusterUpdateSlotsConfigWith(sender,senderConfigEpoch,hdr->myslots);
 
         /* 2) We also check for the reverse condition, that is, the sender
@@ -1301,13 +1451,23 @@ int clusterProcessPacket(clusterLink *link) {
          * new configuration, so other nodes that have an updated table must
          * do it. In this way A will stop to act as a master (or can try to
          * failover if there are the conditions to win the election). */
+        //2.检测与1相反的条件，sender发送的槽位信息比当前节点已知槽位信息的配置纪元低 这时要通知对方
+        //一个重新连入集群的主节点很可能携带过时的信息，经常导致这种情况的发生
+        //如：
+        //A负责slot 1，2，3 B是A的从节点
+        //A断连，B晋升为主节点
+        //B断连，A恢复连接但已不应负责slot 1，2，3
+        //两者强行切换，没有进行平时该有的通知转移，A仍认为自己负责slot 1，2，3
         if (sender && dirty_slots) {
             int j;
-
+            //遍历全部slot(当前节点保存的信息)
             for (j = 0; j < CLUSTER_SLOTS; j++) {
+                //检测当前slot是否在消息的bitmap中被覆盖
                 if (bitmapTestBit(hdr->myslots,j)) {
+                    //若当前slot由sender负责或未被覆盖，则跳过
                     if (server.cluster->slots[j] == sender ||
                         server.cluster->slots[j] == NULL) continue;
+                    //如果当前slot的配置纪元大于sender的配置纪元
                     if (server.cluster->slots[j]->configEpoch >
                         senderConfigEpoch)
                     {
@@ -1315,6 +1475,7 @@ int clusterProcessPacket(clusterLink *link) {
                             "Node %.40s has old slots configuration, sending "
                             "an UPDATE message about %.40s",
                                 sender->name, server.cluster->slots[j]->name);
+                        //向sender发送UPDATE消息，当前更新的slot信息
                         clusterSendUpdate(sender->link,
                             server.cluster->slots[j]);
 
@@ -1329,14 +1490,17 @@ int clusterProcessPacket(clusterLink *link) {
 
         /* If our config epoch collides with the sender's try to fix
          * the problem. */
+        //如果双方都是主节点，配置纪元相同但信息不统一
         if (sender &&
             nodeIsMaster(myself) && nodeIsMaster(sender) &&
             senderConfigEpoch == myself->configEpoch)
         {
+            //处理配置纪元冲突
             clusterHandleConfigEpochCollision(sender);
         }
 
         /* Get info from the gossip section */
+        //处理gossip协议的PING，PONG消息
         if (sender) clusterProcessGossipSection(hdr,link);
     } else if (type == CLUSTERMSG_TYPE_FAIL) {
        //......
@@ -1349,25 +1513,33 @@ int clusterProcessPacket(clusterLink *link) {
     } else if (type == CLUSTERMSG_TYPE_MFSTART) {
        //......
     } else if (type == CLUSTERMSG_TYPE_UPDATE) {
+        //处理第二种情况发送的UPDATE消息
         clusterNode *n; /* The node the update is about. */
+        //消息种节点的配置纪元
         uint64_t reportedConfigEpoch =
                     ntohu64(hdr->data.update.nodecfg.configEpoch);
 
         if (!sender) return 1;  /* We don't know the sender. */
+        //查找需要更新的节点
         n = clusterLookupNode(hdr->data.update.nodecfg.nodename);
         if (!n) return 1;   /* We don't know the reported node. */
+        //需要更新的节点的信息配置纪元较高，返回
+        //这种情况发生在先后接收两个UPDATE，接收的后一个的时候
         if (n->configEpoch >= reportedConfigEpoch) return 1; /* Nothing new. */
 
         /* If in our current config the node is a slave, set it as a master. */
+        //如果需要更新的节点是从节点，更改其属性为主节点
         if (nodeIsSlave(n)) clusterSetNodeAsMaster(n);
 
         /* Update the node's configEpoch. */
+        //更新配置纪元
         n->configEpoch = reportedConfigEpoch;
         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                              CLUSTER_TODO_FSYNC_CONFIG);
 
         /* Check the bitmap of served slots and update our
          * config accordingly. */
+        //更新这个节点的slot信息
         clusterUpdateSlotsConfigWith(n,reportedConfigEpoch,
             hdr->data.update.nodecfg.slots);
     } else {
@@ -1376,6 +1548,7 @@ int clusterProcessPacket(clusterLink *link) {
     return 1;
 }
 
+//更新节点的slot信息
 void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoch, unsigned char *slots) {
     int j;
     clusterNode *curmaster, *newmaster = NULL;
@@ -1392,33 +1565,42 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
     /* Here we set curmaster to this node or the node this node
      * replicates to if it's a slave. In the for loop we are
      * interested to check if slots are taken away from curmaster. */
+    //获取当前主节点或当前从节点从属主节点的信息
     curmaster = nodeIsMaster(myself) ? myself : myself->slaveof;
 
+    //发送这条消息的不能是自己
     if (sender == myself) {
         serverLog(LL_WARNING,"Discarding UPDATE message about myself.");
         return;
     }
 
+    //遍历所有slot(当前节点保存的集群信息)
     for (j = 0; j < CLUSTER_SLOTS; j++) {
+        //如果当前slot在消息的bitmap中已被覆盖
         if (bitmapTestBit(slots,j)) {
             /* The slot is already bound to the sender of this message. */
+            //并且由sender负责，跳过
             if (server.cluster->slots[j] == sender) continue;
 
             /* The slot is in importing state, it should be modified only
              * manually via redis-trib (example: a resharding is in progress
              * and the migrating side slot was already closed and is advertising
              * a new config. We still want the slot to be closed manually). */
+            //处于导入状态，应只能通过redis-trib修改，跳过
             if (server.cluster->importing_slots_from[j]) continue;
 
             /* We rebind the slot to the new node claiming it if:
              * 1) The slot was unassigned or the new node claims it with a
              *    greater configEpoch.
              * 2) We are not currently importing the slot. */
+            //1. slot在当前节点的记录中未被覆盖/消息来源节点配置纪元更大
+            //2. 当前未导入这个slot
             if (server.cluster->slots[j] == NULL ||
                 server.cluster->slots[j]->configEpoch < senderConfigEpoch)
             {
                 /* Was this slot mine, and still contains keys? Mark it as
                  * a dirty slot. */
+                //如果这个slot由自己负责，且其中有数据，则属于发生冲突的slot
                 if (server.cluster->slots[j] == myself &&
                     countKeysInSlot(j) &&
                     sender != myself)
@@ -1426,10 +1608,13 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
                     dirty_slots[dirty_slots_count] = j;
                     dirty_slots_count++;
                 }
-
+                
+                //如果这个slot属于当前节点的主节点，则表示发生了故障转移
                 if (server.cluster->slots[j] == curmaster)
                     newmaster = sender;
+                //删除这个slot
                 clusterDelSlot(j);
+                //将其分配给消息来源节点
                 clusterAddSlot(sender,j);
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                                      CLUSTER_TODO_UPDATE_STATE|
@@ -1445,10 +1630,14 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
      *    master.
      * 2) We are a slave and our master is left without slots. We need
      *    to replicate to the new slots owner. */
+    //如果至少有一个slot从一个节点被重新分配到另一个配置纪元更大的节点，有两种情况
+    //1.当前节点是不再处理任何slot的主节点，应作为新主节点的从节点
+    //2.当前节点是从节点，当前节点的主节点不再处理任何slot，也应作为新主节点的从节点
     if (newmaster && curmaster->numslots == 0) {
         serverLog(LL_WARNING,
             "Configuration change detected. Reconfiguring myself "
             "as a replica of %.40s", sender->name);
+        //将sender设为当前节点的主节点
         clusterSetMaster(sender);
         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                              CLUSTER_TODO_UPDATE_STATE|
@@ -1461,6 +1650,8 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
          *
          * In order to maintain a consistent state between keys and slots
          * we need to remove all the keys from the slots we lost. */
+        //进行到这里，如果接收到一个要求删除由当前节点负责且仍存有信息的slot的UPDATE消息，但同时当前节点仍负责一些slot，此时主节点不能直接被降为从节点
+        //为保持slot与key的关系，需要将slot中的key先删除
         for (j = 0; j < dirty_slots_count; j++)
             delKeysInSlot(dirty_slots[j]);
     }
@@ -1479,6 +1670,7 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
 
     serverAssertWithInfo(NULL,key,retval == DICT_OK);
     if (val->type == OBJ_LIST) signalListAsReady(db, key);
+    //这一步将开始寻找对影slot与其所属主节点
     if (server.cluster_enabled) slotToKeyAdd(key);
  }
 
@@ -1522,6 +1714,7 @@ void slotToKeyUpdateKey(robj *key, int add) {
 void slaveofCommand(client *c) {
     /* SLAVEOF is not allowed in cluster mode as replication is automatically
      * configured using the current address of the master node. */
+    //当前正处于集群模式时，不允许再手动建立主从关系
     if (server.cluster_enabled) {
         addReplyError(c,"SLAVEOF not allowed in cluster mode.");
         return;
@@ -1529,22 +1722,29 @@ void slaveofCommand(client *c) {
 
     /* The special host/port combination "NO" "ONE" turns the instance
      * into a master. Otherwise the new master address is set. */
+    //SLAVEOF NO ONE
+    //使从节点恢复为主节点，不丢弃已同步到的数据
     if (!strcasecmp(c->argv[1]->ptr,"no") &&
         !strcasecmp(c->argv[2]->ptr,"one")) {
+        //如果有主节点IP
         if (server.masterhost) {
+            //取消复制，设置当前节点为主节点
             replicationUnsetMaster();
+            //以sds形式获取client信息，写入日志
             sds client = catClientInfoString(sdsempty(),c);
             serverLog(LL_NOTICE,"MASTER MODE enabled (user request from '%s')",
                 client);
             sdsfree(client);
         }
+    //SLAVEOF <host> <port>
     } else {
         long port;
-
+        //端口号
         if ((getLongFromObjectOrReply(c, c->argv[2], &port, NULL) != C_OK))
             return;
-
+        
         /* Check if we are already attached to the specified slave */
+        //检测是否已将其作为主节点
         if (server.masterhost && !strcasecmp(server.masterhost,c->argv[1]->ptr)
             && server.masterport == port) {
             serverLog(LL_NOTICE,"SLAVE OF would result into synchronization with the master we are already connected with. No operation performed.");
@@ -1553,7 +1753,9 @@ void slaveofCommand(client *c) {
         }
         /* There was no previous master or the user specified a different one,
          * we can continue. */
+        //设置主节点
         replicationSetMaster(c->argv[1]->ptr, port);
+        //将client信息写入日志
         sds client = catClientInfoString(sdsempty(),c);
         serverLog(LL_NOTICE,"SLAVE OF %s:%d enabled (user request from '%s')",
             server.masterhost, server.masterport, client);
@@ -1568,14 +1770,17 @@ void slaveofCommand(client *c) {
 ```c
 void replicationSetMaster(char *ip, int port) {
     int was_master = server.masterhost == NULL;
-
+    //清除原主节点ip
     sdsfree(server.masterhost);
+    //设置新的host port
     server.masterhost = sdsnew(ip);
     server.masterport = port;
+    //释放之前的主节点
     if (server.master) {
         freeClient(server.master);
     }
     //block.c unblockClient操作
+    //解除所有client的阻塞状态
     disconnectAllBlockedClients(); /* Clients blocked in master, now slave. */
 
     /* Force our slaves to resync with us as well. They may hopefully be able
@@ -1586,31 +1791,39 @@ void replicationSetMaster(char *ip, int port) {
     cancelReplicationHandshake();
     /* Before destroying our master state, create a cached master using
      * our own parameters, to later PSYNC with the new master. */
+    //先用自己的参数做一次缓存，可能会在在同步时做快速恢复
     if (was_master) replicationCacheMasterUsingMyself();
+    //复制状态改为待连接
     server.repl_state = REPL_STATE_CONNECT;
     server.repl_down_since = 0;
 }
 ```
 
-断开主从关系
+断开主从关系，设置当前节点为主节点
 
 ```c
 void replicationUnsetMaster(void) {
     if (server.masterhost == NULL) return; /* Nothing to do. */
+    //释放主节点ip
     sdsfree(server.masterhost);
     server.masterhost = NULL;
     /* When a slave is turned into a master, the current replication ID
      * (that was inherited from the master at synchronization time) is
      * used as secondary ID up to the current offset, and a new replication
      * ID is created to continue with a new replication history. */
+    //切换复制id
     shiftReplicationId();
+    //释放客户端
     if (server.master) freeClient(server.master);
+    //释放缓存，不再使用
     replicationDiscardCachedMaster();
+    //取消复制
     cancelReplicationHandshake();
     /* Disconnecting all the slaves is required: we need to inform slaves
      * of the replication ID change (see shiftReplicationId() call). However
      * the slaves will be able to partially resync with us, so it will be
      * a very fast reconnection. */
+    //与其他从节点断开连接
     disconnectSlaves();
     server.repl_state = REPL_STATE_NONE;
 
@@ -1618,12 +1831,14 @@ void replicationUnsetMaster(void) {
      * with a SELECT statement. This is forced after a full resync, but
      * with PSYNC version 2, there is no need for full resync after a
      * master switch. */
+    //强制触发全量同步
     server.slaveseldb = -1;
 
     /* Once we turn from slave to master, we consider the starting time without
      * slaves (that is used to count the replication backlog time to live) as
      * starting from now. Otherwise the backlog will be freed after a
      * failover if slaves do not connect immediately. */
+    //设置无从节点状态开始的时间
     server.repl_no_slaves_since = server.unixtime;
 }
 ```
@@ -4077,9 +4292,817 @@ void sentinelCheckObjectivelyDown(sentinelRedisInstance *master) {
 }
 ```
 
+##### 00x16 故障转移
 
+------
 
+**确认故障转移**
 
+仍然是在sentinelHandleRedisInstance()中，在完成S_DOWN标记后
 
+用sentinelStartFailoverIfNeeded()进一步判断是否可以开始进行故障转移工作
 
+需要满足条件：
 
+- 主节点已被标识客观下线
+- 没有正在进行的故障转移
+- 一段时间内没有进行故障转移
+
+```c
+int sentinelStartFailoverIfNeeded(sentinelRedisInstance *master) {
+    /* We can't failover if the master is not in O_DOWN state. */
+    if (!(master->flags & SRI_O_DOWN)) return 0;
+
+    /* Failover already in progress? */
+    if (master->flags & SRI_FAILOVER_IN_PROGRESS) return 0;
+
+    /* Last failover attempt started too little time ago? */
+    if (mstime() - master->failover_start_time <
+        master->failover_timeout*2)
+    {
+        if (master->failover_delay_logged != master->failover_start_time) {
+            time_t clock = (master->failover_start_time +
+                            master->failover_timeout*2) / 1000;
+            char ctimebuf[26];
+
+            ctime_r(&clock,ctimebuf);
+            ctimebuf[24] = '\0'; /* Remove newline. */
+            master->failover_delay_logged = master->failover_start_time;
+            serverLog(LL_WARNING,
+                "Next failover delay: I will not start a failover before %s",
+                ctimebuf);
+        }
+        return 0;
+    }
+
+    sentinelStartFailover(master);
+    return 1;
+}
+```
+
+如果符合条件则调用sentinelStartFailover()函数在sentinel视角上将主节点设置未故障转移状态
+
+```c
+void sentinelStartFailover(sentinelRedisInstance *master) {
+    serverAssert(master->flags & SRI_MASTER);
+
+    master->failover_state = SENTINEL_FAILOVER_STATE_WAIT_START;
+    master->flags |= SRI_FAILOVER_IN_PROGRESS;
+    master->failover_epoch = ++sentinel.current_epoch;
+    sentinelEvent(LL_WARNING,"+new-epoch",master,"%llu",
+        (unsigned long long) sentinel.current_epoch);
+    sentinelEvent(LL_WARNING,"+try-failover",master,"%@");
+    master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC;
+    master->failover_state_change_time = mstime();
+}
+```
+
+**确认客观下线&选举leader预处理**
+
+当前sentinel确认故障转移状态后强制向其他sentinel发送 `SENTINEL is-master-down-by-addr <ip> <port> <current_epoch> <myid/*>` 命令最后判断主节点是否失效
+
+最后一个参数，发送自己的id表示请求收到命令的sentinel选举自己为leader
+
+发送"*"则表示发送投票
+
+```c
+#define SENTINEL_ASK_FORCED (1<<0)
+#define SENTINEL_ASK_PERIOD 1000
+
+void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int flags) {
+    dictIterator *di;
+    dictEntry *de;
+	
+    //遍历监控此主节点的所有sentinel(包括自己)
+    di = dictGetIterator(master->sentinels);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *ri = dictGetVal(de);
+        //距离这个sentinel最后一次回复SENTINEL is-master-down-by-addr命令的时间
+        mstime_t elapsed = mstime() - ri->last_master_down_reply_time;
+        char port[32];
+        int retval;
+
+        /* If the master state from other sentinel is too old, we clear it. */
+        //间隔时间过长，清除本sentinel视角下这个sentinel的leader信息
+        if (elapsed > SENTINEL_ASK_PERIOD*5) {
+            ri->flags &= ~SRI_MASTER_DOWN;
+            sdsfree(ri->leader);
+            ri->leader = NULL;
+        }
+
+        /* Only ask if master is down to other sentinels if:
+         *
+         * 1) We believe it is down, or there is a failover in progress.
+         * 2) Sentinel is connected.
+         * 3) We did not received the info within SENTINEL_ASK_PERIOD ms. */
+        //1.主节点没有客观下线，跳过这个sentinel
+        if ((master->flags & SRI_S_DOWN) == 0) continue;
+        //2.这个sentinel与主节点断连了，跳过
+        if (ri->link->disconnected) continue;
+        //3.SENTINEL_ASK_PERIOD时间内有回复且没有强制更新，跳过
+        if (!(flags & SENTINEL_ASK_FORCED) &&
+            mstime() - ri->last_master_down_reply_time < SENTINEL_ASK_PERIOD)
+            continue;
+
+        /* Ask */
+        //以上三条都不满足，则向这个sentinel请求支持/询问leader信息
+        ll2string(port,sizeof(port),master->addr->port);
+        //如果当前主节点处于故障转移状态，则发送本节点的id，请求对方选自己为leader
+        //否则发送"*"表示投票
+        retval = redisAsyncCommand(ri->link->cc,
+                    sentinelReceiveIsMasterDownReply, ri,
+                    "SENTINEL is-master-down-by-addr %s %s %llu %s",
+                    master->addr->ip, port,
+                    sentinel.current_epoch,
+                    (master->failover_state > SENTINEL_FAILOVER_STATE_NONE) ?
+                    sentinel.myid : "*");
+        //已发送未回复命令+1
+        if (retval == C_OK) ri->link->pending_commands++;
+    }
+    dictReleaseIterator(di);
+}
+```
+
+收到命令的sentinel响应询问命令
+
+```c
+void sentinelCommand(client *c) {
+    //......
+    } else if (!strcasecmp(c->argv[1]->ptr,"is-master-down-by-addr")) {
+        /* SENTINEL IS-MASTER-DOWN-BY-ADDR <ip> <port> <current-epoch> <runid>
+         *
+         * Arguments:
+         *
+         * ip and port are the ip and port of the master we want to be
+         * checked by Sentinel. Note that the command will not check by
+         * name but just by master, in theory different Sentinels may monitor
+         * differnet masters with the same name.
+         *
+         * current-epoch is needed in order to understand if we are allowed
+         * to vote for a failover leader or not. Each Sentinel can vote just
+         * one time per epoch.
+         *
+         * runid is "*" if we are not seeking for a vote from the Sentinel
+         * in order to elect the failover leader. Otherwise it is set to the
+         * runid we want the Sentinel to vote if it did not already voted.
+         */
+        sentinelRedisInstance *ri;
+        long long req_epoch;
+        uint64_t leader_epoch = 0;
+        char *leader = NULL;
+        long port;
+        int isdown = 0;
+
+        //命令+参数共为6个
+        if (c->argc != 6) goto numargserr;
+    	//获取目标主节点的port和当前纪元
+        if (getLongFromObjectOrReply(c,c->argv[3],&port,NULL) != C_OK ||
+            getLongLongFromObjectOrReply(c,c->argv[4],&req_epoch,NULL)
+                                                              != C_OK)
+            return;
+        //根据ip，port查找主节点
+        ri = getSentinelRedisInstanceByAddrAndRunID(sentinel.masters,
+            c->argv[2]->ptr,port,NULL);
+
+        /* It exists? Is actually a master? Is subjectively down? It's down.
+         * Note: if we are in tilt mode we always reply with "0". */
+        //主节点存在并被本节点标记客观下线，本sentinel未处于TILT模式
+        //则设置同意主节点下线标志
+        if (!sentinel.tilt && ri && (ri->flags & SRI_S_DOWN) &&
+                                    (ri->flags & SRI_MASTER))
+            isdown = 1;
+    
+        /* Vote for the master (or fetch the previous vote) if the request
+         * includes a runid, otherwise the sender is not seeking for a vote. */
+        //命令中包含id，则给发送者投一票(原英文注释可能有问题)
+        //否则发送者并不是在请求支持
+        //如果检测到在本纪元或更高纪元已投过票，则告知发送者自己支持的是谁(以最高纪元为准)
+        if (ri && ri->flags & SRI_MASTER && strcasecmp(c->argv[5]->ptr,"*")) {
+            //根据请求决定是否更新支持者，并返回当前支持者
+            leader = sentinelVoteLeader(ri,(uint64_t)req_epoch,
+                                            c->argv[5]->ptr,
+                                            &leader_epoch);
+        }
+
+        /* Reply with a three-elements multi-bulk reply:
+         * down state, leader, vote epoch. */
+        //表示返回三条信息
+        addReplyMultiBulkLen(c,3);
+        //是否同意主节点下线
+        addReply(c, isdown ? shared.cone : shared.czero);
+        //支持leader的id，没有则发送"*"
+        addReplyBulkCString(c, leader ? leader : "*");
+        //支持leader的纪元
+        addReplyLongLong(c, (long long)leader_epoch);
+        if (leader) sdsfree(leader);
+    }
+	//......
+}
+
+//投票操作实现
+//尝试为id为req_runid的sentinel投票
+#define SENTINEL_MAX_DESYNC 1000
+
+char *sentinelVoteLeader(sentinelRedisInstance *master, uint64_t req_epoch, char *req_runid, uint64_t *leader_epoch) {
+   	//如果请求投票的纪元更高
+    //则更新当前纪元的值
+    if (req_epoch > sentinel.current_epoch) {
+        sentinel.current_epoch = req_epoch;
+        sentinelFlushConfig();
+        sentinelEvent(LL_WARNING,"+new-epoch",master,"%llu",
+            (unsigned long long) sentinel.current_epoch);
+    }
+	
+    //如果当前主节点leader的纪元小于请求投票的sentinel的纪元
+    if (master->leader_epoch < req_epoch && sentinel.current_epoch <= req_epoch)
+    {
+        //清除目前主节点的leader记录
+        sdsfree(master->leader);
+        //将本sentinel视角下主节点的leader设置为请求投票的sentinel
+        //即为这个sentinel投票
+        master->leader = sdsnew(req_runid);
+        //更新leader的纪元记录
+        master->leader_epoch = sentinel.current_epoch;
+        sentinelFlushConfig();
+        //发送为leader投票的通知
+        sentinelEvent(LL_WARNING,"+vote-for-leader",master,"%s %llu",
+            master->leader, (unsigned long long) master->leader_epoch);
+        /* If we did not voted for ourselves, set the master failover start
+         * time to now, in order to force a delay before we can start a
+         * failover for the same master. */
+        //如果不是投票给自己，随机延后故障转移开始时间
+        if (strcasecmp(master->leader,sentinel.myid))
+            master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC;
+    }
+    //如果没有变化，则保持原来的投票
+	
+    //保存leader纪元
+    *leader_epoch = master->leader_epoch;
+    return master->leader ? sdsnew(master->leader) : NULL;
+}
+```
+
+发送命令的一方设置了sentinelReceiveIsMasterDownReply()来处理回复
+
+```c
+void sentinelReceiveIsMasterDownReply(redisAsyncContext *c, void *reply, void *privdata) {
+    sentinelRedisInstance *ri = privdata;
+    instanceLink *link = c->data;
+    redisReply *r;
+
+    if (!reply || !link) return;
+    //接收回复，已发送未回复命令-1
+    link->pending_commands--;
+    r = reply;
+
+    /* Ignore every error or unexpected reply.
+     * Note that if the command returns an error for any reason we'll
+     * end clearing the SRI_MASTER_DOWN flag for timeout anyway. */
+    if (r->type == REDIS_REPLY_ARRAY && r->elements == 3 &&
+        r->element[0]->type == REDIS_REPLY_INTEGER &&
+        r->element[1]->type == REDIS_REPLY_STRING &&
+        r->element[2]->type == REDIS_REPLY_INTEGER)
+    {
+        //更新最近一次回复下线状态的时间
+        ri->last_master_down_reply_time = mstime();
+        //判断对方是否同意主节点下线
+        if (r->element[0]->integer == 1) {
+            ri->flags |= SRI_MASTER_DOWN;
+        } else {
+            ri->flags &= ~SRI_MASTER_DOWN;
+        }
+        //如果第二条回复不是"*"，则这条回复带有其支持信息
+        if (strcmp(r->element[1]->str,"*")) {
+            /* If the runid in the reply is not "*" the Sentinel actually
+             * replied with a vote. */
+            //更新本sentinel视角下对方sentinel支持的leader
+            sdsfree(ri->leader);
+            if ((long long)ri->leader_epoch != r->element[2]->integer)
+                serverLog(LL_WARNING,
+                    "%s voted for %s %llu", ri->name,
+                    r->element[1]->str,
+                    (unsigned long long) r->element[2]->integer);
+            ri->leader = sdsnew(r->element[1]->str);
+            ri->leader_epoch = r->element[2]->integer;
+        }
+    }
+}
+```
+
+经过以上交互，一个sentinel向其他sentinel确认了一个主节点的客观下线，并且获取了其他sentinel最终支持哪个leader
+
+**故障转移流程**
+
+确认主节点客观下线后，开始分步执行故障转移
+
+```c
+void sentinelFailoverStateMachine(sentinelRedisInstance *ri) {
+    serverAssert(ri->flags & SRI_MASTER);
+
+    if (!(ri->flags & SRI_FAILOVER_IN_PROGRESS)) return;
+
+    switch(ri->failover_state) {
+        case SENTINEL_FAILOVER_STATE_WAIT_START:
+            sentinelFailoverWaitStart(ri);
+            break;
+        case SENTINEL_FAILOVER_STATE_SELECT_SLAVE:
+            sentinelFailoverSelectSlave(ri);
+            break;
+        case SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE:
+            sentinelFailoverSendSlaveOfNoOne(ri);
+            break;
+        case SENTINEL_FAILOVER_STATE_WAIT_PROMOTION:
+            sentinelFailoverWaitPromotion(ri);
+            break;
+        case SENTINEL_FAILOVER_STATE_RECONF_SLAVES:
+            sentinelFailoverReconfNextSlave(ri);
+            break;
+    }
+}
+```
+
+每一个周期只进行故障转移的一步，共五步，其间failover_state状态连续
+
+**准备故障转移**
+
+之前最后一次确认主节点客观下线的同时，发现O_DOWN的节点进行了向其他节点发送了选举请求
+
+，并获得了其他sentinel最终支持的leader
+
+```c
+#define SENTINEL_ELECTION_TIMEOUT 10000
+
+void sentinelFailoverWaitStart(sentinelRedisInstance *ri) {
+    char *leader;
+    int isleader;
+
+    /* Check if we are the leader for the failover epoch. */
+    //获取故障转移选定纪元的leader
+    leader = sentinelGetLeader(ri, ri->failover_epoch);
+    //检查自己是否是leader
+    isleader = leader && strcasecmp(leader,sentinel.myid) == 0;
+    sdsfree(leader);
+
+    /* If I'm not the leader, and it is not a forced failover via
+     * SENTINEL FAILOVER, then I can't continue with the failover. */
+    //如果当前sentient节点不是leader，又不要求强制故障转移，则结束
+    //强制转移在failover作为sentinel命令执行时被设置
+    if (!isleader && !(ri->flags & SRI_FORCE_FAILOVER)) {
+        int election_timeout = SENTINEL_ELECTION_TIMEOUT;
+	   
+        /* The election timeout is the MIN between SENTINEL_ELECTION_TIMEOUT
+         * and the configured failover timeout. */
+        //当选后超时时间为SENTINEL_ELECTION_TIMEOUT与配置中failover_timeout中的最小值
+        if (election_timeout > ri->failover_timeout)
+            election_timeout = ri->failover_timeout;
+        /* Abort the failover if I'm not the leader after some time. */
+        //当前leader超时
+        if (mstime() - ri->failover_start_time > election_timeout) {
+            //发送取消故障转移的通知
+            sentinelEvent(LL_WARNING,"-failover-abort-not-elected",ri,"%@");
+            //取消对ri的故障转移(更改状态)
+            sentinelAbortFailover(ri);
+        }
+        return;
+    }
+    //当前sentinel恰好为leader
+    //发送本sentinel获胜，可进行转移的通知
+    sentinelEvent(LL_WARNING,"+elected-leader",ri,"%@");
+    //是否模拟故障
+    if (sentinel.simfailure_flags & SENTINEL_SIMFAILURE_CRASH_AFTER_ELECTION)
+        sentinelSimFailureCrash();
+    //更新状态为 SENTINEL_FAILOVER_STATE_SELECT_SLAVE 等待选择晋升的节点
+    ri->failover_state = SENTINEL_FAILOVER_STATE_SELECT_SLAVE;
+    //更新状态改变时间
+    ri->failover_state_change_time = mstime();
+    sentinelEvent(LL_WARNING,"+failover-state-select-slave",ri,"%@");
+}
+
+//获取当前leader
+//此函数不以调用它的sentinel主体，而是以O_DOWN的主节点为主体
+char *sentinelGetLeader(sentinelRedisInstance *master, uint64_t epoch) {
+    dict *counters;
+    dictIterator *di;
+    dictEntry *de;
+    unsigned int voters = 0, voters_quorum;
+    char *myvote;
+    char *winner = NULL;
+    uint64_t leader_epoch;
+    uint64_t max_votes = 0;
+	
+    serverAssert(master->flags & (SRI_O_DOWN|SRI_FAILOVER_IN_PROGRESS));
+    //投票统计字典
+    counters = dictCreate(&leaderVotesDictType,NULL);
+	//设置字典大小
+    voters = dictSize(master->sentinels)+1; /* All the other sentinels and me.*/
+
+    /* Count other sentinels votes */
+    //遍历监控此主节点的所有sentinel
+    di = dictGetIterator(master->sentinels);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *ri = dictGetVal(de);
+        //如果这个sentinel选定了一个当前纪元的leader，则为它选定的leader投一票
+        if (ri->leader != NULL && ri->leader_epoch == sentinel.current_epoch)
+            sentinelLeaderIncr(counters,ri->leader);
+    }
+    dictReleaseIterator(di);
+
+    /* Check what's the winner. For the winner to win, it needs two conditions:
+     * 1) Absolute majority between voters (50% + 1).
+     * 2) And anyway at least master->quorum votes. */
+    //遍历统计字典，得出选举获胜的sentinel
+    //1.票数过半(50%+1)
+    //2.票数高与设置的master->quorum
+    di = dictGetIterator(counters);
+    while((de = dictNext(di)) != NULL) {
+        uint64_t votes = dictGetUnsignedIntegerVal(de);
+
+        if (votes > max_votes) {
+            max_votes = votes;
+            winner = dictGetKey(de);
+        }
+    }
+    dictReleaseIterator(di);
+
+    /* Count this Sentinel vote:
+     * if this Sentinel did not voted yet, either vote for the most
+     * common voted sentinel, or for itself if no vote exists at all. */
+    //如果当前sentinel没投票，则由本sentinel模拟为其选择支持的leader
+    //如果在之前有胜者，则投给胜者
+    //无则投给本sentinel
+    if (winner)
+        myvote = sentinelVoteLeader(master,epoch,winner,&leader_epoch);
+    else
+        myvote = sentinelVoteLeader(master,epoch,sentinel.myid,&leader_epoch);
+
+    if (myvote && leader_epoch == epoch) {
+        //给刚刚模拟支持的leader增加一票
+        uint64_t votes = sentinelLeaderIncr(counters,myvote);
+
+        if (votes > max_votes) {
+            max_votes = votes;
+            winner = myvote;
+        }
+    }
+	//计算需要的最小票数
+    voters_quorum = voters/2+1;
+    //胜者的票数小于最小票数或小于配置的限制
+    //选举无效，无胜者
+    if (winner && (max_votes < voters_quorum || max_votes < master->quorum))
+        winner = NULL;
+	
+    //返回胜者
+    winner = winner ? sdsnew(winner) : NULL;
+    sdsfree(myvote);
+    dictRelease(counters);
+    return winner;
+}
+```
+
+**选择晋升的从节点**
+
+进入下一个周期，继续执行故障转移
+
+状态为SENTINEL_FAILOVER_STATE_SELECT_SLAVE
+
+需要选择一个从节点为其晋升
+
+```c
+void sentinelFailoverSelectSlave(sentinelRedisInstance *ri) {
+    sentinelRedisInstance *slave = sentinelSelectSlave(ri);
+
+    /* We don't handle the timeout in this state as the function aborts
+     * the failover or go forward in the next state. */
+    if (slave == NULL) {
+        sentinelEvent(LL_WARNING,"-failover-abort-no-good-slave",ri,"%@");
+        sentinelAbortFailover(ri);
+    } else {
+        sentinelEvent(LL_WARNING,"+selected-slave",slave,"%@");
+        slave->flags |= SRI_PROMOTED;
+        ri->promoted_slave = slave;
+        ri->failover_state = SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE;
+        ri->failover_state_change_time = mstime();
+        sentinelEvent(LL_NOTICE,"+failover-state-send-slaveof-noone",
+            slave, "%@");
+    }
+}
+
+sentinelRedisInstance *sentinelSelectSlave(sentinelRedisInstance *master) {
+    sentinelRedisInstance **instance =
+        zmalloc(sizeof(instance[0])*dictSize(master->slaves));
+    sentinelRedisInstance *selected = NULL;
+    int instances = 0;
+    dictIterator *di;
+    dictEntry *de;
+    mstime_t max_master_down_time = 0;
+
+    if (master->flags & SRI_S_DOWN)
+        max_master_down_time += mstime() - master->s_down_since_time;
+    max_master_down_time += master->down_after_period * 10;
+
+    di = dictGetIterator(master->slaves);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *slave = dictGetVal(de);
+        mstime_t info_validity_time;
+
+        if (slave->flags & (SRI_S_DOWN|SRI_O_DOWN)) continue;
+        if (slave->link->disconnected) continue;
+        if (mstime() - slave->link->last_avail_time > SENTINEL_PING_PERIOD*5) continue;
+        if (slave->slave_priority == 0) continue;
+
+        /* If the master is in SDOWN state we get INFO for slaves every second.
+         * Otherwise we get it with the usual period so we need to account for
+         * a larger delay. */
+        if (master->flags & SRI_S_DOWN)
+            info_validity_time = SENTINEL_PING_PERIOD*5;
+        else
+            info_validity_time = SENTINEL_INFO_PERIOD*3;
+        if (mstime() - slave->info_refresh > info_validity_time) continue;
+        if (slave->master_link_down_time > max_master_down_time) continue;
+        instance[instances++] = slave;
+    }
+    dictReleaseIterator(di);
+    if (instances) {
+        qsort(instance,instances,sizeof(sentinelRedisInstance*),
+            compareSlavesForPromotion);
+        selected = instance[0];
+    }
+    zfree(instance);
+    return selected;
+}
+```
+
+**执行晋升**
+
+下面让这个从节点变为主节点
+
+```c
+void sentinelFailoverSendSlaveOfNoOne(sentinelRedisInstance *ri) {
+    int retval;
+
+    /* We can't send the command to the promoted slave if it is now
+     * disconnected. Retry again and again with this state until the timeout
+     * is reached, then abort the failover. */
+    if (ri->promoted_slave->link->disconnected) {
+        if (mstime() - ri->failover_state_change_time > ri->failover_timeout) {
+            sentinelEvent(LL_WARNING,"-failover-abort-slave-timeout",ri,"%@");
+            sentinelAbortFailover(ri);
+        }
+        return;
+    }
+
+    /* Send SLAVEOF NO ONE command to turn the slave into a master.
+     * We actually register a generic callback for this command as we don't
+     * really care about the reply. We check if it worked indirectly observing
+     * if INFO returns a different role (master instead of slave). */
+    retval = sentinelSendSlaveOf(ri->promoted_slave,NULL,0);
+    if (retval != C_OK) return;
+    sentinelEvent(LL_NOTICE, "+failover-state-wait-promotion",
+        ri->promoted_slave,"%@");
+    ri->failover_state = SENTINEL_FAILOVER_STATE_WAIT_PROMOTION;
+    ri->failover_state_change_time = mstime();
+}
+```
+
+处理晋升超时
+
+```c
+void sentinelFailoverWaitPromotion(sentinelRedisInstance *ri) {
+    /* Just handle the timeout. Switching to the next state is handled
+     * by the function parsing the INFO command of the promoted slave. */
+    if (mstime() - ri->failover_state_change_time > ri->failover_timeout) {
+        sentinelEvent(LL_WARNING,"-failover-abort-slave-timeout",ri,"%@");
+        sentinelAbortFailover(ri);
+    }
+}
+```
+
+**同步新主节点**
+
+向属于原主节点的从节点发送 `SLAVE OF` 命令，指向新的主节点，并开始同步
+
+```c
+void sentinelFailoverReconfNextSlave(sentinelRedisInstance *master) {
+    dictIterator *di;
+    dictEntry *de;
+    int in_progress = 0;
+
+    di = dictGetIterator(master->slaves);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *slave = dictGetVal(de);
+
+        if (slave->flags & (SRI_RECONF_SENT|SRI_RECONF_INPROG))
+            in_progress++;
+    }
+    dictReleaseIterator(di);
+
+    di = dictGetIterator(master->slaves);
+    while(in_progress < master->parallel_syncs &&
+          (de = dictNext(di)) != NULL)
+    {
+        sentinelRedisInstance *slave = dictGetVal(de);
+        int retval;
+
+        /* Skip the promoted slave, and already configured slaves. */
+        if (slave->flags & (SRI_PROMOTED|SRI_RECONF_DONE)) continue;
+
+        /* If too much time elapsed without the slave moving forward to
+         * the next state, consider it reconfigured even if it is not.
+         * Sentinels will detect the slave as misconfigured and fix its
+         * configuration later. */
+        if ((slave->flags & SRI_RECONF_SENT) &&
+            (mstime() - slave->slave_reconf_sent_time) >
+            SENTINEL_SLAVE_RECONF_TIMEOUT)
+        {
+            sentinelEvent(LL_NOTICE,"-slave-reconf-sent-timeout",slave,"%@");
+            slave->flags &= ~SRI_RECONF_SENT;
+            slave->flags |= SRI_RECONF_DONE;
+        }
+
+        /* Nothing to do for instances that are disconnected or already
+         * in RECONF_SENT state. */
+        if (slave->flags & (SRI_RECONF_SENT|SRI_RECONF_INPROG)) continue;
+        if (slave->link->disconnected) continue;
+
+        /* Send SLAVEOF <new master>. */
+        retval = sentinelSendSlaveOf(slave,
+                master->promoted_slave->addr->ip,
+                master->promoted_slave->addr->port);
+        if (retval == C_OK) {
+            slave->flags |= SRI_RECONF_SENT;
+            slave->slave_reconf_sent_time = mstime();
+            sentinelEvent(LL_NOTICE,"+slave-reconf-sent",slave,"%@");
+            in_progress++;
+        }
+    }
+    dictReleaseIterator(di);
+
+    /* Check if all the slaves are reconfigured and handle timeout. */
+    sentinelFailoverDetectEnd(master);
+}
+```
+
+**转移收尾**
+
+主要是确定所有从节点目标都被修正
+
+```c
+void sentinelFailoverDetectEnd(sentinelRedisInstance *master) {
+    int not_reconfigured = 0, timeout = 0;
+    dictIterator *di;
+    dictEntry *de;
+    mstime_t elapsed = mstime() - master->failover_state_change_time;
+
+    /* We can't consider failover finished if the promoted slave is
+     * not reachable. */
+    if (master->promoted_slave == NULL ||
+        master->promoted_slave->flags & SRI_S_DOWN) return;
+
+    /* The failover terminates once all the reachable slaves are properly
+     * configured. */
+    di = dictGetIterator(master->slaves);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *slave = dictGetVal(de);
+
+        if (slave->flags & (SRI_PROMOTED|SRI_RECONF_DONE)) continue;
+        if (slave->flags & SRI_S_DOWN) continue;
+        not_reconfigured++;
+    }
+    dictReleaseIterator(di);
+
+    /* Force end of failover on timeout. */
+    if (elapsed > master->failover_timeout) {
+        not_reconfigured = 0;
+        timeout = 1;
+        sentinelEvent(LL_WARNING,"+failover-end-for-timeout",master,"%@");
+    }
+
+    if (not_reconfigured == 0) {
+        sentinelEvent(LL_WARNING,"+failover-end",master,"%@");
+        master->failover_state = SENTINEL_FAILOVER_STATE_UPDATE_CONFIG;
+        master->failover_state_change_time = mstime();
+        
+    }
+
+    /* If I'm the leader it is a good idea to send a best effort SLAVEOF
+     * command to all the slaves still not reconfigured to replicate with
+     * the new master. */
+    if (timeout) {
+        dictIterator *di;
+        dictEntry *de;
+
+        di = dictGetIterator(master->slaves);
+        while((de = dictNext(di)) != NULL) {
+            sentinelRedisInstance *slave = dictGetVal(de);
+            int retval;
+
+            if (slave->flags & (SRI_RECONF_DONE|SRI_RECONF_SENT)) continue;
+            if (slave->link->disconnected) continue;
+
+            retval = sentinelSendSlaveOf(slave,
+                    master->promoted_slave->addr->ip,
+                    master->promoted_slave->addr->port);
+            if (retval == C_OK) {
+                sentinelEvent(LL_NOTICE,"+slave-reconf-sent-be",slave,"%@");
+                slave->flags |= SRI_RECONF_SENT;
+            }
+        }
+        dictReleaseIterator(di);
+    }
+}
+```
+
+**更新主节点在线状态**
+
+回到sentinelHandleRedisInstance()，紧接着再次执行sentinelAskMasterStateToOtherSentinels()
+
+不管需不需要故障转移都会执行，flags为SENTINEL_NO_FLAGS
+
+作用是向各sentinel发送 `SENTINEL is-master-down-by-addr` 更新主节点在线状态，不强制更新leader支持情况
+
+**主从切换后sentinel视角下的状态更新**
+
+再上一层，回到sentinelHandleDictOfRedisInstances()
+
+因为进行了主从切换，进入switch_to_promoted分支
+
+需要更新sentinel主节点的记录
+
+更新sentinel视角下主节点的从节点记录
+
+```c
+void sentinelHandleDictOfRedisInstances(dict *instances) {
+    //......
+    if (switch_to_promoted)
+        sentinelFailoverSwitchToPromotedSlave(switch_to_promoted);
+    dictReleaseIterator(di);
+}
+
+void sentinelFailoverSwitchToPromotedSlave(sentinelRedisInstance *master) {
+    sentinelRedisInstance *ref = master->promoted_slave ?
+                                 master->promoted_slave : master;
+
+    sentinelEvent(LL_WARNING,"+switch-master",master,"%s %s %d %s %d",
+        master->name, master->addr->ip, master->addr->port,
+        ref->addr->ip, ref->addr->port);
+
+    sentinelResetMasterAndChangeAddress(master,ref->addr->ip,ref->addr->port);
+}
+
+int sentinelResetMasterAndChangeAddress(sentinelRedisInstance *master, char *ip, int port) {
+    sentinelAddr *oldaddr, *newaddr;
+    sentinelAddr **slaves = NULL;
+    int numslaves = 0, j;
+    dictIterator *di;
+    dictEntry *de;
+
+    newaddr = createSentinelAddr(ip,port);
+    if (newaddr == NULL) return C_ERR;
+
+    /* Make a list of slaves to add back after the reset.
+     * Don't include the one having the address we are switching to. */
+    di = dictGetIterator(master->slaves);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *slave = dictGetVal(de);
+
+        if (sentinelAddrIsEqual(slave->addr,newaddr)) continue;
+        slaves = zrealloc(slaves,sizeof(sentinelAddr*)*(numslaves+1));
+        slaves[numslaves++] = createSentinelAddr(slave->addr->ip,
+                                                 slave->addr->port);
+    }
+    dictReleaseIterator(di);
+
+    /* If we are switching to a different address, include the old address
+     * as a slave as well, so that we'll be able to sense / reconfigure
+     * the old master. */
+    if (!sentinelAddrIsEqual(newaddr,master->addr)) {
+        slaves = zrealloc(slaves,sizeof(sentinelAddr*)*(numslaves+1));
+        slaves[numslaves++] = createSentinelAddr(master->addr->ip,
+                                                 master->addr->port);
+    }
+
+    /* Reset and switch address. */
+    sentinelResetMaster(master,SENTINEL_RESET_NO_SENTINELS);
+    oldaddr = master->addr;
+    master->addr = newaddr;
+    master->o_down_since_time = 0;
+    master->s_down_since_time = 0;
+
+    /* Add slaves back. */
+    for (j = 0; j < numslaves; j++) {
+        sentinelRedisInstance *slave;
+
+        slave = createSentinelRedisInstance(NULL,SRI_SLAVE,slaves[j]->ip,
+                    slaves[j]->port, master->quorum, master);
+        releaseSentinelAddr(slaves[j]);
+        if (slave) sentinelEvent(LL_NOTICE,"+slave",slave,"%@");
+    }
+    zfree(slaves);
+
+    /* Release the old address at the end so we are safe even if the function
+     * gets the master->addr->ip and master->addr->port as arguments. */
+    releaseSentinelAddr(oldaddr);
+    sentinelFlushConfig();
+    return C_OK;
+}
+```
